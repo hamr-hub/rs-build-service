@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::hardening::LoadShedder;
 use hotpot_cacheproto::RemoteCache;
 use hotpot_core::BuildId;
 use hotpot_core::model::BuildEvent;
@@ -33,6 +34,13 @@ pub struct AppState {
     cancels: Arc<Mutex<CancelTable>>,
     /// 构建事件广播（见 [`StreamSignal`]）。
     stream: broadcast::Sender<StreamSignal>,
+    /// 并发限流器。
+    ///
+    /// 放在 `AppState` 上而不是只存在于中间件闭包里，是为了让 `/metrics`
+    /// 能读出当前占用：限流在生产上表现为"莫名其妙的一批 503"，没有这个
+    /// 指标就只能靠猜。`hotpot_concurrency_in_flight` 长期贴着
+    /// `hotpot_concurrency_limit` 就说明容量该调了。
+    pub shedder: LoadShedder,
 }
 
 /// 推送给 SSE 订阅者的信号。
@@ -61,6 +69,9 @@ pub enum StreamSignal {
 /// 订阅者从库里按游标全量补齐即可——广播只负责"有变化"的提示，不负责
 /// 可靠投递，所以容量不需要大到能缓存整个构建的日志。
 const STREAM_CHANNEL_CAPACITY: usize = 1024;
+
+/// 并发上限的默认值；实际值以 `--max-concurrent-requests` 为准。
+pub const DEFAULT_CONCURRENCY_LIMIT: usize = 256;
 
 /// 取消信号表。
 ///
@@ -94,6 +105,7 @@ impl AppState {
             default_toolchain: "default".to_string(),
             cancels: Arc::new(Mutex::new(CancelTable::default())),
             stream: broadcast::channel(STREAM_CHANNEL_CAPACITY).0,
+            shedder: LoadShedder::new(DEFAULT_CONCURRENCY_LIMIT),
         }
     }
 
@@ -126,6 +138,12 @@ impl AppState {
         self
     }
 
+    /// 设置并发上限（须在 `load_shed_middleware` 读取之前调用）。
+    pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
+        self.shedder = LoadShedder::new(limit);
+        self
+    }
+
     /// 广播一条流信号。
     ///
     /// 没有订阅者时 `Err` 是正常情况（没人看日志），直接忽略。
@@ -139,42 +157,117 @@ impl AppState {
     }
 
     /// 为构建注册取消通道，返回接收端。
-    ///
-    /// 若该构建在注册之前已被请求取消（见 [`CancelTable`]），返回的
-    /// `Receiver` 初值即为 `true`——取消不丢。
     pub async fn register_cancel(&self, id: BuildId) -> watch::Receiver<bool> {
-        let (tx, rx) = watch::channel(false);
-        let mut table = self.cancels.lock().await;
-        if table.pending.remove(&id) {
-            // 发送失败只意味着没有接收端，但这里接收端 `rx` 就在手上，
-            // 因此它必然成功。
-            let _ = tx.send(true);
-        }
-        table.live.insert(id, tx);
-        rx
+        self.cancels.lock().await.register(id)
     }
 
     /// 移除取消通道，并清掉可能残留的取消意图。
     pub async fn remove_cancel(&self, id: BuildId) {
-        let mut table = self.cancels.lock().await;
-        table.live.remove(&id);
-        table.pending.remove(&id);
+        self.cancels.lock().await.remove(id);
     }
 
     /// 请求取消构建。
-    ///
-    /// 返回 `true` 表示取消**已被接受**：要么直接送达正在运行的构建，
-    /// 要么已登记为待生效意图、将在该构建开始执行时立刻生效。
-    /// 返回 `false` 只在通道已消失（构建刚结束）这一种情况下发生。
     pub async fn signal_cancel(&self, id: BuildId) -> bool {
-        let mut table = self.cancels.lock().await;
-        match table.live.get(&id) {
+        self.cancels.lock().await.signal(id)
+    }
+}
+
+impl CancelTable {
+    /// 注册通道；若此前已登记取消意图，立即补发。
+    fn register(&mut self, id: BuildId) -> watch::Receiver<bool> {
+        let (tx, rx) = watch::channel(false);
+        if self.pending.remove(&id) {
+            // 接收端 `rx` 就在手上，发送必然有接收者。
+            let _ = tx.send(true);
+        }
+        self.live.insert(id, tx);
+        rx
+    }
+
+    /// 移除通道并清掉待生效意图。
+    fn remove(&mut self, id: BuildId) {
+        self.live.remove(&id);
+        self.pending.remove(&id);
+    }
+
+    /// 请求取消。返回是否被接受。
+    fn signal(&mut self, id: BuildId) -> bool {
+        match self.live.get(&id) {
             Some(tx) => tx.send(true).is_ok(),
             // 通道还没注册（认领与注册之间的窗口）：记住意图。
             None => {
-                table.pending.insert(id);
+                self.pending.insert(id);
                 true
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> CancelTable {
+        CancelTable::default()
+    }
+
+    /// 这是本模块最关键的不变量：取消请求绝不能因为「来得早了一点」而丢失。
+    ///
+    /// 背景：worker 认领构建（状态置 `dispatched`）后要先拉源码才注册通道，
+    /// git 场景下这段窗口可能有几分钟。窗口内的取消如果直接丢弃，接口仍会
+    /// 返回 200 与原样的 `dispatched` 记录——用户以为取消成功，构建却跑完了。
+    #[test]
+    fn cancel_before_register_is_not_lost() {
+        let mut t = table();
+        let id = BuildId::new();
+
+        assert!(t.signal(id), "取消应当被接受");
+        let mut rx = t.register(id);
+        assert!(*rx.borrow_and_update(), "注册通道时必须补发取消意图");
+    }
+
+    #[test]
+    fn cancel_after_register_is_delivered_live() {
+        let mut t = table();
+        let id = BuildId::new();
+
+        let mut rx = t.register(id);
+        assert!(!*rx.borrow_and_update(), "初始应为未取消");
+
+        assert!(t.signal(id));
+        assert!(*rx.borrow_and_update(), "取消应送达运行中的构建");
+    }
+
+    #[test]
+    fn register_without_cancel_stays_false() {
+        let mut t = table();
+        let mut rx = t.register(BuildId::new());
+        assert!(!*rx.borrow_and_update(), "没有取消请求时初值必须是 false");
+    }
+
+    /// id 复用时（测试里直接复用，生产中不会），历史取消不能牵连新构建。
+    #[test]
+    fn remove_clears_pending_intent() {
+        let mut t = table();
+        let id = BuildId::new();
+        assert!(t.signal(id));
+        t.remove(id);
+
+        let mut rx = t.register(id);
+        assert!(
+            !*rx.borrow_and_update(),
+            "remove 应清掉待生效意图，否则新构建一出生就被取消"
+        );
+    }
+
+    /// 多次取消是幂等的：重复点击取消不应产生额外效果，也不应 panic。
+    #[test]
+    fn repeated_cancel_is_idempotent() {
+        let mut t = table();
+        let id = BuildId::new();
+        assert!(t.signal(id));
+        assert!(t.signal(id));
+        let mut rx = t.register(id);
+        assert!(*rx.borrow_and_update());
     }
 }

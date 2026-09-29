@@ -39,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         executor: format!("{:?}", state.executor),
         toolchain: state.default_toolchain.clone(),
         version: env!("CARGO_PKG_VERSION"),
+        shedder: state.shedder.clone(),
     };
     let toolchains = crate::toolchains::ToolchainState {
         docker_host: match &*state.executor {

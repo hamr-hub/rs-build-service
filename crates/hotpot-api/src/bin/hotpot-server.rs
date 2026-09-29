@@ -144,7 +144,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .unwrap_or_else(|_| "unknown".to_string());
 
+    // 并发上限在这里就定下来：中间件与 `/metrics` 必须共用同一个限流器，
+    // 否则指标反映的是一个没人使用的实例，饱和时反而看不出问题。
+    let concurrency_limit = args
+        .max_concurrent_requests
+        .unwrap_or(hotpot_api::state::DEFAULT_CONCURRENCY_LIMIT);
     let state = AppState::new(scheduler.clone(), store.clone())
+        .with_concurrency_limit(concurrency_limit)
         .with_cache(remote_cache.clone())
         .with_executor(executor.clone())
         .with_git_source(allow_git_source);
@@ -292,7 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 顺序有讲究：压缩最内层（只压已经生成好的响应），限流在压缩外层
     // （限的是"正在占用资源"的数量，而不是响应体的字节数），超时再外层，
     // CORS 最外层（要能在被拒的响应上也带上跨源头）。
-    let shedder = hardening::LoadShedder::new(args.max_concurrent_requests.unwrap_or(256));
+    let shedder = state.shedder.clone();
     let request_timeout = Duration::from_secs(args.request_timeout_secs.unwrap_or(30));
     let body_limit = args.max_request_body.unwrap_or(256 * 1024);
     let cors = hardening::CorsOrigins::parse(args.cors_origins.as_deref().unwrap_or(""));

@@ -27,6 +27,8 @@ pub struct MetricsSource {
     pub executor: String,
     pub toolchain: String,
     pub version: &'static str,
+    /// 并发限流器：暴露占用量，否则限流在生产上只是"一批没来由的 503"。
+    pub shedder: crate::hardening::LoadShedder,
 }
 
 /// Prometheus 文本格式渲染。
@@ -290,6 +292,28 @@ pub async fn render(source: &MetricsSource) -> String {
             &[(vec![], g.cas_bytes_freed.load(Relaxed) as f64)],
         );
     }
+
+    // --- HTTP 并发占用 ---
+    // 采集顺序刻意放在最后：它读的是信号量，与其它指标无副作用。
+    metric(
+        &mut out,
+        "hotpot_concurrency_limit",
+        "gauge",
+        "HTTP 并发上限（不含 SSE 日志流）",
+        &[],
+        &[(vec![], source.shedder.limit() as f64)],
+    );
+    metric(
+        &mut out,
+        "hotpot_concurrency_in_flight",
+        "gauge",
+        "当前占用中的普通请求数（不含 SSE 日志流）",
+        &[],
+        &[(
+            vec![],
+            source.shedder.limit() as f64 - source.shedder.available() as f64,
+        )],
+    );
 
     // --- 运行时信息 ---
     metric(
