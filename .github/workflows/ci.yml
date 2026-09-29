@@ -68,15 +68,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 固定在 24：Node 22 自带的 npm 10.9.x 在 Actions 上会偶发
+      # "Exit handler never called!" 导致 npm ci 以 1 退出。
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
       # `npm run build` 内含 `vue-tsc -b`，类型错误会让这一档失败。
       - name: Typecheck & build
