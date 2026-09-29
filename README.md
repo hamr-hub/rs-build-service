@@ -3,7 +3,7 @@
 **开源、可自托管的 Rust 构建服务。** 远程触发构建、多级内容寻址缓存、
 本地热重载开发、生产零停机部署——一条工具链，覆盖从编码到上线的完整回路。
 
-[![CI](https://github.com/hyx/rs-build-service/actions/workflows/ci.yml/badge.svg)](https://github.com/hyx/rs-build-service/actions/workflows/ci.yml)
+[![CI](https://github.com/hamr-hub/rs-build-service/actions/workflows/ci.yml/badge.svg)](https://github.com/hamr-hub/rs-build-service/actions/workflows/ci.yml)
 
 ## 为什么
 
@@ -125,7 +125,11 @@ crates/
 
 深入阅读：
 
-- [架构设计](docs/design/architecture.md)
+- [入门说明](docs/getting-started.md)
+- [平台使用手册](docs/guide/user-manual.md)
+- [系统架构文档](docs/design/system-architecture.md)
+- [功能设计文档](docs/design/feature-design.md)
+- [总体架构设计（设计决策）](docs/design/architecture.md)
 - [愿景](docs/VISION.md)
 - [热重载与部署调研](docs/research/03-hot-reload-deployment.md)
 - [基准基线](docs/design/benchmark-baseline.md)
