@@ -52,6 +52,14 @@ npm run build     # vue-tsc 类型检查 + 生产构建
 npm run preview   # 预览生产产物
 ```
 
+> `package-lock.json` 里的 `resolved` 指向**公共 registry**（`registry.npmjs.org`）。
+> 本机若配了内网镜像源，`npm install` 会把内网地址写回 lockfile，导致 GitHub
+> runner 装不上（`getaddrinfo ENOTFOUND`）。需要重新生成时显式指定：
+>
+> ```bash
+> npm install --registry=https://registry.npmjs.org/
+> ```
+
 ## 结构
 
 ```
