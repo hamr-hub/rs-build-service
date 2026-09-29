@@ -22,6 +22,8 @@ pub struct MetricsSource {
     /// 未挂载缓存协议时为 None。
     pub cache: Option<RemoteCache>,
     pub workers: usize,
+    /// 回收器累计计数。
+    pub gc_stats: Arc<crate::gc::GcStats>,
     pub executor: String,
     pub toolchain: String,
     pub version: &'static str,
@@ -206,6 +208,87 @@ pub async fn render(source: &MetricsSource) -> String {
             &[(vec![], bytes as f64)],
         ),
         Err(e) => out.push_str(&format!("# hotpot_store_bytes unavailable: {e}\n")),
+    }
+
+    // --- 资源回收 ---
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let g = &source.gc_stats;
+        metric(
+            &mut out,
+            "hotpot_gc_sweeps_total",
+            "counter",
+            "资源回收扫描轮次",
+            &[],
+            &[(vec![], g.sweeps.load(Relaxed) as f64)],
+        );
+        metric(
+            &mut out,
+            "hotpot_gc_sessions_present",
+            "gauge",
+            "最近一轮扫描到的会话目录数",
+            &[],
+            &[(vec![], g.sessions_present.load(Relaxed) as f64)],
+        );
+        metric(
+            &mut out,
+            "hotpot_gc_sessions_removed_total",
+            "counter",
+            "累计删除的会话目录数",
+            &[],
+            &[(vec![], g.sessions_removed.load(Relaxed) as f64)],
+        );
+        metric(
+            &mut out,
+            "hotpot_gc_sessions_skipped_active_total",
+            "counter",
+            "因构建非终态而跳过的会话目录数（活跃构建保护生效的证据）",
+            &[],
+            &[(
+                vec![("reason", "build_active".to_string())],
+                g.sessions_skipped_active.load(Relaxed) as f64,
+            )],
+        );
+        metric(
+            &mut out,
+            "hotpot_gc_session_bytes_freed_total",
+            "counter",
+            "累计由会话回收释放的字节数",
+            &[],
+            &[(vec![], g.session_bytes_freed.load(Relaxed) as f64)],
+        );
+        metric(
+            &mut out,
+            "hotpot_gc_git_workspaces_removed_total",
+            "counter",
+            "累计删除的 git 共享工作区数",
+            &[],
+            &[(vec![], g.workspaces_removed.load(Relaxed) as f64)],
+        );
+        metric(
+            &mut out,
+            "hotpot_gc_git_workspace_bytes_freed_total",
+            "counter",
+            "累计由 git 工作区回收释放的字节数",
+            &[],
+            &[(vec![], g.workspace_bytes_freed.load(Relaxed) as f64)],
+        );
+        metric(
+            &mut out,
+            "hotpot_gc_cas_runs_total",
+            "counter",
+            "CAS 容量回收轮次",
+            &[],
+            &[(vec![], g.cas_gc_runs.load(Relaxed) as f64)],
+        );
+        metric(
+            &mut out,
+            "hotpot_gc_cas_bytes_freed_total",
+            "counter",
+            "CAS 容量回收累计释放的字节数",
+            &[],
+            &[(vec![], g.cas_bytes_freed.load(Relaxed) as f64)],
+        );
     }
 
     // --- 运行时信息 ---

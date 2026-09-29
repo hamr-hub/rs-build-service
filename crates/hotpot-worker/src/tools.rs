@@ -88,9 +88,14 @@ pub async fn ensure_sccache(tools_dir: &Path, arch: &str) -> Result<PathBuf, Str
     // 解包：压缩包内布局为 <asset>/sccache，只提取该二进制。
     // 用系统 tar 解包，避免为一次引导下载引入 tar/flate2 依赖
     // （Hotpot 的运行前提本就包含 docker 与 curl）。
+    // 必须带 --strip-components 1：归档成员路径是 <asset>/sccache，
+    // 不加会解成 dir/<asset>/sccache，而 bin 期望在 dir/sccache
+    // （GNU/BSD tar 均支持该选项）。
     let status = Command::new("tar")
         .arg("-xzf")
         .arg(&archive_path)
+        .arg("--strip-components")
+        .arg("1")
         .arg("-C")
         .arg(&dir)
         .arg(format!("{asset}/sccache"))

@@ -107,6 +107,24 @@ cargo run -p hotpot-api --bin hotpot-server
 
 配置优先级：**内置默认值 < TOML 配置文件 < 环境变量 < 命令行参数**。
 
+### 2.5 自动工具链供给与 warm 复用
+
+Docker 执行器会在 cargo 运行前自动完成环境准备（均经持久化卷跨构建复用）：
+
+- **系统 C/C++ 工具链**：slim 镜像没有 cc/make，构建脚本调用 `cc`/`make`
+  必然失败；slim 变体自动安装 `build-essential`，deb 归档与 apt 索引
+  持久化，warm 构建跳过下载。Alpine 镜像不支持自动供给，会显式报错。
+- **warm target 卷**：同一项目 × 镜像 × 目标 triple × 构建模式复用
+  CARGO_TARGET_DIR，cargo fingerprint 命中时连构建脚本都不重新执行
+  （sccache 无法缓存 build-script-build，这是 sccache 全命中仍慢的根因）。
+  默认总配额 20GiB，按 LRU 自动回收，近 30 分钟内使用的条目受保护。
+- **共享 git 工作区**：同一仓库 URL 的所有构建在同一路径检出
+  （部分克隆，按需 fetch），避免源码路径变化导致 fingerprint 失效；
+  同一项目的构建在服务进程内串行，不同项目互不阻塞。
+
+实测 warm 构建：fd 4.3s、bat 7.6s、ripgrep 7.9s；详见
+[benchmark-baseline.md M9](../design/benchmark-baseline.md)。
+
 ## 3. CLI 完整参考
 
 CLI 名为 `hotpot`（crate：`hotpot-cli`）。

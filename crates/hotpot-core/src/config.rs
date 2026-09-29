@@ -16,6 +16,16 @@ pub struct ServerConfig {
     pub workers: u32,
     /// 单构建默认超时（秒）。
     pub build_timeout_secs: u64,
+    /// 成功构建的会话目录保留时长（秒）；0 = 用默认值。
+    pub session_max_age_secs: u64,
+    /// 失败/超时构建的会话目录保留时长（秒）；0 = 用默认值。
+    pub session_failed_max_age_secs: u64,
+    /// 额外保留最近 N 个终态构建的会话目录；0 = 不按数量保留。
+    pub session_keep_last: u64,
+    /// 后台资源回收（会话目录 + git 工作区 + CAS 容量）扫描间隔（秒）；0 = 用默认值。
+    pub gc_interval_secs: u64,
+    /// git 共享工作区最长保留时长（秒）；0 = 用默认值。
+    pub git_workspace_max_age_secs: u64,
     pub cache: CacheConfig,
 }
 
@@ -26,6 +36,11 @@ impl Default for ServerConfig {
             data_dir: PathBuf::from("./hotpot-data"),
             workers: 0,
             build_timeout_secs: 1800,
+            session_max_age_secs: 0,
+            session_failed_max_age_secs: 0,
+            session_keep_last: 0,
+            gc_interval_secs: 0,
+            git_workspace_max_age_secs: 0,
             cache: CacheConfig::default(),
         }
     }
@@ -85,5 +100,14 @@ impl ServerConfig {
             .sccache_dir
             .clone()
             .unwrap_or_else(|| self.data_dir.join("sccache"))
+    }
+}
+
+/// 0 视为「未设置」，回落到 `fallback`。
+pub fn secs_or(value: u64, fallback: std::time::Duration) -> std::time::Duration {
+    if value == 0 {
+        fallback
+    } else {
+        std::time::Duration::from_secs(value)
     }
 }

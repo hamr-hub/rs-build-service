@@ -54,79 +54,94 @@ impl<'a> PhaseSink<'a> {
     }
 }
 
+/// 准备**共享** Git 工作区：同一项目（URL）的所有构建复用 tools_dir 下的
+/// 同一份仓库与检出路径，配合 warm target 卷让 warm 构建成为 cargo 意义上
+/// 的真正 no-op——否则每次构建源码路径都变（sessions/<id>/src），cargo
+/// fingerprint 会重编译项目自身的全部 crate。
+///
+/// 首次按 `--filter=blob:none` 做部分克隆（历史树可达、blob 按需拉取，
+/// 避免大仓库一次性全量下载）；每次构建 fetch 指定 ref/sha 后强制检出。
+/// 并发安全由调用方的按项目锁保证（见 driver 中 git_workspace_lock）。
+pub(super) async fn prepare_git_workspace(
+    workspaces_root: &Path,
+    url: &str,
+    ref_name: &str,
+    sha: Option<&str>,
+    sink: &mut PhaseSink<'_>,
+) -> Result<PathBuf> {
+    use hotpot_core::ContentDigest;
+    // 短 id 只是为了目录名可读；真正的隔离靠 `git_project_lock` 按完整 URL 加锁。
+    let id = ContentDigest::of_bytes(url.as_bytes()).to_hex();
+    let id = &id[..16];
+    let root = workspaces_root.join(id);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&root)?;
+
+    if !repo.join(".git").exists() {
+        sink.phase(format!("git clone --filter=blob:none {url}"))
+            .await?;
+        let clone = run_git(
+            &["clone", "--quiet", "--filter=blob:none", url],
+            &[repo.as_os_str()],
+            &root,
+        )
+        .await?;
+        if !clone.success {
+            sink.stderr_lines(&clone.stderr).await?;
+            // 服务端不支持 partial clone filter：回退普通浅克隆（功能等价）。
+            sink.phase("partial clone unsupported; falling back to shallow clone")
+                .await?;
+            run_git(
+                &["clone", "--quiet", "--depth", "1", url],
+                &[repo.as_os_str()],
+                &root,
+            )
+            .await?
+            .ok()?;
+        }
+    }
+
+    // 浅回退克隆可能不含目标 ref：按需补 fetch；固定 sha 时直接 fetch sha。
+    let target = sha.unwrap_or(ref_name);
+    sink.phase(format!("git fetch origin {target}")).await?;
+    let fetched = run_git(&["fetch", "--quiet", "origin", target], &[], &repo).await?;
+    if !fetched.success {
+        sink.stderr_lines(&fetched.stderr).await?;
+        return Err(hotpot_core::Error::Other(format!(
+            "could not fetch {target} from {url}"
+        )));
+    }
+    // 强制覆盖检出：工作区里没有用户修改，--force 保证每次构建起点确定。
+    run_git(
+        &["checkout", "--quiet", "--force", "--detach", target],
+        &[],
+        &repo,
+    )
+    .await?
+    .ok()?;
+
+    // **必须校验实际检出的 commit**。指定 sha 时若 HEAD 与之不符，说明
+    // fetch 到的是别的东西；此时若放行，产物会被贴上「按请求的 sha 构建」
+    // 的假标签——缓存与产物 provenance 全部失真。宁可构建失败。
+    let head = run_git(&["rev-parse", "HEAD"], &[], &repo).await?;
+    let head = head.stdout.trim();
+    if let Some(want) = sha
+        && !head.eq_ignore_ascii_case(want)
+    {
+        return Err(hotpot_core::Error::Other(format!(
+            "git checkout {want} landed on {head} for {url}; refusing to build a different commit"
+        )));
+    }
+    // 记录实际构建的 commit：既方便排查，也让产物有可追溯的源码标识。
+    sink.phase(format!("building {url} at {head}")).await?;
+    Ok(repo)
+}
+
 /// git 命令执行结果。
 struct GitOutput {
     success: bool,
     stdout: String,
     stderr: String,
-}
-
-/// 准备 Git 源码：clone/fetch 到 `dest` 并检出目标引用。
-pub(super) async fn prepare_git(
-    url: &str,
-    ref_name: &str,
-    sha: Option<&str>,
-    dest: &Path,
-    sink: &mut PhaseSink<'_>,
-) -> Result<PathBuf> {
-    sink.phase(format!("git clone --depth 1 --branch {ref_name} {url}"))
-        .await?;
-
-    // 优先浅克隆指定引用（最快路径）；服务端不支持时回退 init+fetch。
-    let clone = run_git(
-        &[
-            "clone", "--quiet", "--depth", "1", "--branch", ref_name, url,
-        ],
-        &[dest.as_os_str()],
-        // clone 时目标目录尚不存在，以父目录为 cwd。
-        dest.parent().unwrap_or_else(|| Path::new(".")),
-    )
-    .await?;
-    if !clone.success {
-        sink.stderr_lines(&clone.stderr).await?;
-        sink.phase("shallow clone unsupported; fetching full ref")
-            .await?;
-        run_git(&["init", "--quiet"], &[], dest).await?.ok()?;
-        run_git(&["remote", "add", "origin", url], &[], dest)
-            .await?
-            .ok()?;
-        run_git(&["fetch", "--quiet", "origin", ref_name], &[], dest)
-            .await?
-            .ok()?;
-        run_git(
-            &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
-            &[],
-            dest,
-        )
-        .await?
-        .ok()?;
-    }
-
-    // 指定 sha：浅克隆的分支头可能不是该 sha（如固定到 PR 内提交），按需补取。
-    if let Some(sha) = sha {
-        let head = run_git(&["rev-parse", "HEAD"], &[], dest).await?;
-        if head.stdout.trim() != sha {
-            sink.phase(format!("git fetch origin {sha}")).await?;
-            let fetched = run_git(&["fetch", "--quiet", "origin", sha], &[], dest).await?;
-            if !fetched.success {
-                sink.stderr_lines(&fetched.stderr).await?;
-                return Err(hotpot_core::Error::Other(format!(
-                    "could not fetch pinned sha {sha} from {url}"
-                )));
-            }
-        }
-        run_git(&["checkout", "--quiet", "--detach", sha], &[], dest)
-            .await?
-            .ok()?;
-        let head = run_git(&["rev-parse", "HEAD"], &[], dest).await?;
-        if head.stdout.trim() != sha {
-            return Err(hotpot_core::Error::Other(format!(
-                "git checkout {sha} produced {}",
-                head.stdout.trim()
-            )));
-        }
-    }
-    Ok(dest.to_path_buf())
 }
 
 impl GitOutput {

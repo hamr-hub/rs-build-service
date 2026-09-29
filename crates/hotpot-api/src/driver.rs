@@ -4,16 +4,18 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use hotpot_core::model::{BuildRecord, BuildStatus, EventKind, SourceSpec};
 use hotpot_core::{ArtifactMeta, ContentDigest};
 use hotpot_store::BlobStore;
 use hotpot_worker::{BuildPlan, EndReason, ExecutorKind, run_build};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-use crate::source::{PhaseSink, prepare_git};
+use crate::source::{PhaseSink, prepare_git_workspace};
 use crate::state::AppState;
 
 const LEASE: Duration = Duration::from_secs(60);
@@ -21,6 +23,29 @@ const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// 构建失败时写进 `error` 字段的 stderr 尾部行数。
 const ERROR_TAIL_LINES: usize = 12;
+
+/// 按项目的共享工作区锁注册表（每个唯一 URL 泄漏一个 static Mutex，
+/// 开销可忽略；换来 'static 守卫，可跨整个构建 await 持有）。
+static GIT_LOCKS: OnceLock<Mutex<HashMap<String, &'static Mutex<()>>>> = OnceLock::new();
+
+/// 获取某 git 项目的全构建周期锁：同一项目（含不同 ref）的构建在同一进程
+/// 内串行，避免一个构建正在编译时另一个构建强制 checkout 覆盖源码。
+/// 不同项目互不阻塞。
+async fn git_project_lock(url: &str) -> &'static Mutex<()> {
+    let registry =
+        GIT_LOCKS.get_or_init(|| Mutex::new(HashMap::<String, &'static Mutex<()>>::new()));
+    let key = url.to_string();
+    {
+        let guard = registry.lock().await;
+        if let Some(lock) = guard.get(&key) {
+            return *lock;
+        }
+    }
+    let mut guard = registry.lock().await;
+    *guard
+        .entry(key)
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
+}
 
 /// 自身构建的 sccache 闭环配置：让 Hotpot 的构建复用 Hotpot 自己的
 /// sccache WebDAV 端点（crate 级缓存），而不只是对外提供协议。
@@ -45,6 +70,8 @@ pub struct WorkerConfig {
     pub timeout: Duration,
     /// 是否接受 git 来源构建（会执行不可信代码，默认关闭）。
     pub allow_git_source: bool,
+    /// docker 执行器是否自动安装系统包（气隙/预烘焙镜像可关闭）。
+    pub provision_system_packages: bool,
 }
 
 impl WorkerConfig {
@@ -55,6 +82,7 @@ impl WorkerConfig {
             sccache: None,
             timeout: Duration::from_secs(1800),
             allow_git_source: false,
+            provision_system_packages: true,
         }
     }
 
@@ -117,6 +145,10 @@ async fn handle_build(
     // ---- 源码就位（fetch 阶段；Local 无 IO，Git 在会话目录内 clone）----
     let fetch_started = Instant::now();
     let mut sink = PhaseSink::new(&state.scheduler, rec.id);
+    // 共享 git 工作区需要全构建周期持锁（见 git_project_lock）；guard 在
+    // 函数结束时自动释放。会话级 clone 无需加锁。
+    // 只需要守卫在函数结束时 drop 释放锁，无需读取；下划线前缀保留 Drop。
+    let mut _git_guard: Option<tokio::sync::MutexGuard<'static, ()>> = None;
     let prepared = match &rec.source {
         SourceSpec::Local { path } => Ok(PathBuf::from(path)),
         SourceSpec::Git { url, ref_name, sha } => {
@@ -130,8 +162,23 @@ async fn handle_build(
                 )
                 .await;
             }
-            let src = session_dir.join("src");
-            prepare_git(url, ref_name, sha.as_deref(), &src, &mut sink).await
+            // 复用**稳定路径**的共享工作区：只有工作区路径稳定，cargo 的
+            // target fingerprint 才稳定，第二次构建才能命中增量与 sccache
+            // （每构建一个会话目录 = 永远冷构建）。工作区根与 sccache 无关，
+            // 放在数据目录下由回收器统一清理。
+            //
+            // 同一项目的构建全周期持锁，避免一个构建正在编译时被另一个的
+            // checkout 覆盖源码；不同项目互不阻塞。
+            let lock = git_project_lock(url).await;
+            _git_guard = Some(lock.lock().await);
+            prepare_git_workspace(
+                &data_root.join("git-workspaces"),
+                url,
+                ref_name,
+                sha.as_deref(),
+                &mut sink,
+            )
+            .await
         }
         SourceSpec::Upload { .. } => Err(hotpot_core::Error::Other(
             "upload source kind is not supported yet".to_string(),
@@ -149,8 +196,20 @@ async fn handle_build(
     plan.build_id = rec.id;
     plan.profile = rec.profile.clone();
     plan.timeout = config.timeout;
+    plan.provision_system_packages = config.provision_system_packages;
     plan.cancel = Some(state.register_cancel(rec.id).await);
     plan.first_seq = sink.event_count();
+    // 项目稳定标识：git 用 URL（跨 tag 同一项目），本地用规范化绝对路径。
+    plan.warm_identity = match &rec.source {
+        SourceSpec::Git { url, .. } => Some(url.clone()),
+        SourceSpec::Local { path } => Some(
+            Path::new(path)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.to_string()),
+        ),
+        SourceSpec::Upload { .. } => None,
+    };
     apply_sccache(
         &mut plan,
         config.sccache.as_ref(),
@@ -211,7 +270,7 @@ async fn handle_build(
     let upload_started = Instant::now();
     let mut artifacts = Vec::new();
     if status == BuildStatus::Succeeded {
-        match collect_artifacts(&session_dir, &rec, state) {
+        match collect_artifacts(&warm_target_root(&rec, config), &rec, state) {
             Ok(found) => artifacts = found,
             Err(e) => {
                 status = BuildStatus::Failed;
@@ -413,13 +472,68 @@ fn millis_since(ts_ms: i64) -> u64 {
     (hotpot_core::model::now_ms() - ts_ms).max(0) as u64
 }
 
+/// 本次构建产物所在的 target 根目录：启用 warm target 时是 tools 下的持久化
+/// 卷（与 docker 执行器挂载的目录必须一致），否则是会话目录内的 target。
+fn warm_target_root(rec: &BuildRecord, config: &WorkerConfig) -> PathBuf {
+    // 与 plan.warm_identity 保持一致：本地路径先 canonicalize。
+    let identity_local;
+    let identity: Option<&str> = match &rec.source {
+        SourceSpec::Git { url, .. } => Some(url),
+        SourceSpec::Local { path } => {
+            identity_local = Path::new(path)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.to_string());
+            Some(&identity_local)
+        }
+        SourceSpec::Upload { .. } => None,
+    };
+    // 镜像 tag 必须与 docker 执行器**解析后**的镜像一致：profile 指定工具链
+    // 时官方镜像会被改写版本段（如 1.98-slim + toolchain 1.85 → 1.85-slim），
+    // key 用错版本会把 warm 卷挂错工具链。
+    let image_tag: String = match &config.executor {
+        ExecutorKind::Docker { image, .. } => {
+            let resolved = match &rec.profile.toolchain {
+                Some(spec) => hotpot_core::parse_toolchain(spec)
+                    .map(|tc| hotpot_core::resolve_rust_image(image, &tc).unwrap_or(image.clone()))
+                    .unwrap_or_else(|_| image.clone()),
+                None => image.clone(),
+            };
+            resolved
+                .split_once(':')
+                .map(|(_, t)| t.to_string())
+                .unwrap_or_default()
+        }
+        ExecutorKind::Local => "local".to_string(),
+    };
+    if let (Some(identity), true) = (
+        identity,
+        matches!(config.executor, ExecutorKind::Docker { .. }),
+    ) {
+        let triple = rec.profile.target.as_deref().unwrap_or("host");
+        let mode = match rec.profile.mode {
+            hotpot_core::BuildMode::Debug => "debug",
+            hotpot_core::BuildMode::Release => "release",
+        };
+        if let Some(sccache) = &config.sccache {
+            let key = hotpot_worker::warmcache::key(identity, &image_tag, triple, mode);
+            return hotpot_worker::warmcache::dir(&sccache.tools_dir, &key);
+        }
+    }
+    let data_root = config.data_root.as_path();
+    data_root
+        .join("sessions")
+        .join(rec.id.to_string())
+        .join("target")
+}
+
 /// 收集 profile 目录顶层的可执行/库文件，逐一内容寻址入 CAS。
 fn collect_artifacts(
-    session_dir: &Path,
+    target_root: &Path,
     rec: &BuildRecord,
     state: &AppState,
 ) -> hotpot_core::Result<Vec<ArtifactMeta>> {
-    let mut profile_dir = session_dir.join("target");
+    let mut profile_dir = target_root.to_path_buf();
     if let Some(triple) = &rec.profile.target {
         profile_dir = profile_dir.join(triple);
     }

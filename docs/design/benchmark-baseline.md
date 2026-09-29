@@ -219,3 +219,84 @@ docker images:     rust:1.85-slim-bookworm / rust:1.98-slim-bookworm
 | `cargo clippy --workspace --all-targets` | 0 warning |
 | `cargo test --workspace` | 全部通过（新增协议契约测试 16 项） |
 | `cargo fmt --all` | 通过 |
+
+## M9：真实开源项目构建 + warm 复用两级加速（2026-09-29）
+
+以三个开源项目（`~/.hotpot-e2e/oss.py`，走完整平台：git 就位 →
+release 构建 → CAS 采集）验证**打包速度与产物正确性**。每个项目 cold/warm
+连跑两次，校验：cold/warm 产物 blake3 摘要一致（可复现）、容器内实际
+运行 `--version` 正确。
+
+### 9.1 slim 镜像宿主工具链自动供给
+
+`slim` 镜像刻意不含 cc/make：fd 的 `jemalloc-sys` 构建脚本执行 `make`
+直接 panic（`No such file or directory`）。执行器现按镜像变体自动安装：
+slim → `build-essential`（deb 归档 79MB 持久化复用），全量变体 → 无需，
+Alpine → 显式报错。回归测试：`docker_live::docker_slim_image_auto_installs_build_essential`
+（构建脚本内直接调用 `cc`）。
+
+### 9.2 为什么 sccache 100% 命中仍然慢——warm target 卷
+
+实测 sccache 全命中时 bat 仍需 ~120s。根因：**`build-script-build` 是
+bin crate，sccache 无法缓存，cargo 每次重新编译并运行全部构建脚本**；
+最终 bin crate 与链接同样每次发生。新增两级持久化复用：
+
+1. **warm target 卷**：`tools/warm-targets/<hash>-<镜像tag>-<triple|host>-<mode>`
+   挂载为容器 `/target`，cargo fingerprint 直接判定依赖单元（含构建脚本）
+   为最新。20GiB LRU 配额（30 分钟宽限防删在用目录）。
+2. **共享 git 工作区**：`tools/git-workspaces/<hash>/repo` 挂载为
+   `/workspace`（`--filter=blob:none` 部分克隆，`fetch + checkout --force`）；
+   否则会话路径每次变化，fingerprint 判定项目 crate 全部过期。按 URL 的
+   全构建周期锁保证同项目构建进程内串行。
+
+### 9.3 实测：构建速度（build_ms）
+
+| 项目 | cold | warm | 加速比 | warm 起点对照* |
+|------|-----:|-----:|-------:|------:|
+| fd 10.2.0 | 113.5s | **4.3s** | **26.13x** | 87.7s |
+| bat 0.25.0 | 38.7s | **7.6s** | **5.11x** | 119.0s |
+| ripgrep 14.1.1 | 22.7s | **7.9s** | **2.87x** | 27.7s |
+
+\* 起点对照 = M9 优化前、sccache 全命中但每次全新会话路径的 warm 耗时。
+
+产物正确性：三个项目 cold/warm digest 全部一致；容器内 smoke 实测
+`fd 10.2.0` / `bat 0.25.0` / `ripgrep 14.1.1` 输出正确。
+
+交叉编译另测：aarch64 → x86_64，cold 315.9s → 全 warm（sccache）14.0s
+（**22.6x**），产物 `ELF 64-bit LSB pie executable, x86-64`，amd64 容器
+内实际执行输出正确。
+
+### 9.4 多版本工具链矩阵（Docker 模式）
+
+| 请求 spec | 选用镜像 | 产物实测 rustc |
+|-----------|---------|----------------|
+| `1.85` | `rust:1.85-slim-bookworm` | 1.85.1 |
+| `1.93` | `rust:1.93-slim-bookworm` | 1.93.1 |
+| `1.98.0` | `rust:1.98.0-slim-bookworm` | 1.98.0 |
+| `stable` | `rust:slim-bookworm`（浮动跟踪 stable） | 1.98.1 |
+
+官方 Docker Hub rust 镜像不发布任何 channel tag（无 stable/beta/nightly，
+含 dated nightly）；beta/nightly 请求被显式拒绝并提示钉版本或使用 local
+执行器。Docker 模式 spec 仅用于选镜像，容器内执行不带 `+spec` 的 cargo
+（镜像 default 工具链即请求版本）。
+
+### 9.5 docker_live 实测矩阵（7 项串行）
+
+`crates/hotpot-worker/tests/docker_live.rs` 真实容器实测（非 mock），
+共享持久 tools 目录、static 互斥串行（colima 上并行冷 apt 曾全部超时）：
+
+| 用例 | 验证点 |
+|------|--------|
+| docker_build_success | 产物经挂载回宿主 |
+| docker_build_failure | 真实 rustc 诊断（非空挂载假象） |
+| docker_build_cancel | build.rs 死循环，cancel 后 EndReason::Canceled |
+| docker_partial_toolchain… | 不触发 rustup 同步，复用镜像预装工具链 |
+| docker_slim_image_auto_installs… | build.rs 调 cc，自动装 build-essential |
+| docker_same_arch_musl… | musl-tools 供给，`file(1)` 确认静态链接 |
+| docker_wasm32… | rustlib-cache 复用，`\0asm` 魔数合法 |
+
+apt 步骤加固：dpkg-query 已装包整段跳过（warm 零 apt 开销）；安装前
+清除 archives/lists 锁文件——cancel 杀掉 apt 进行中的容器后，bind 卷上
+残留锁（colima virtiofs 上表现为 "held by process 0"），否则后续构建
+全部 apt 失败。受限网络下 apt 相关用例经真实容器探测（`getent hosts
+deb.debian.org`）秒级跳过。

@@ -34,6 +34,16 @@ pub struct BuildPlan {
     pub cargo_home: Option<PathBuf>,
     /// Docker 模式：预取工具目录（宿主下载好的 Linux sccache 等），挂载到容器 PATH 首位。
     pub tools_dir: Option<PathBuf>,
+    /// Docker 模式：是否自动安装系统包（slim 镜像的 build-essential、交叉工具链）。
+    ///
+    /// 官方 `rust:*-slim` 镜像不带 `cc`，任何含 C 代码的依赖（jemalloc/ring/
+    /// openssl…）都会在 build script 阶段失败，因此默认开启自动供给。
+    /// 但它需要容器能访问 apt 源——**气隙环境**或**自带预烘焙镜像**的用户
+    /// 必须能关掉它，否则每次构建都卡在网络上。
+    pub provision_system_packages: bool,
+    /// 项目的稳定标识（git URL / 本地绝对路径）：设置后在 Docker 模式复用
+    /// 持久化 warm target 卷（按镜像 × triple × mode 分桶）。
+    pub warm_identity: Option<String>,
     /// 透传到构建进程/容器的额外环境变量（如 SCCACHE_WEBDAV_ENDPOINT）。
     pub extra_env: Vec<(String, String)>,
     /// 执行器事件的起始 seq（fetch 等前置阶段可能已占用编号）。
@@ -107,6 +117,8 @@ impl BuildPlan {
             sccache_bin: None,
             cargo_home: None,
             tools_dir: None,
+            provision_system_packages: true,
+            warm_identity: None,
             extra_env: Vec::new(),
             first_seq: 0,
             cancel: None,

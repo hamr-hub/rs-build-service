@@ -2,6 +2,8 @@
 
 pub mod driver;
 pub mod error;
+pub mod gc;
+pub mod hardening;
 pub mod metrics;
 pub mod routes;
 pub mod source;

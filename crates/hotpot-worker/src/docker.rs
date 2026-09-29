@@ -83,8 +83,8 @@ async fn run_inner(
     // 指定工具链时把官方 rust 镜像的版本段换成目标工具链，
     // 保证「宿主工具链」与「容器工具链」一致，否则产物与缓存都不可移植。
     let image = match &toolchain {
-        Some(tc) => match resolve_image(&image, tc) {
-            Some(resolved) => {
+        Some(tc) => match hotpot_core::resolve_rust_image(&image, tc) {
+            Ok(resolved) => {
                 if resolved != image {
                     emit_phase(
                         &tx,
@@ -96,17 +96,13 @@ async fn run_inner(
                 }
                 resolved
             }
-            None => {
+            Err(reason) => {
                 emit_event(
                     &tx,
                     &seq,
                     &plan.build_id,
                     EventKind::Stderr,
-                    format!(
-                        "toolchain '{}' requested but image '{image}' is not an official rust \
-                         image; pass --docker-image to pin a matching image",
-                        tc.rustup_spec()
-                    ),
+                    format!("toolchain '{}' requested but {reason}", tc.rustup_spec()),
                 )
                 .await;
                 return failed(&started, EndReason::SpawnFailed, None);
@@ -150,6 +146,78 @@ async fn run_inner(
         .and_then(|info| info.architecture)
         .unwrap_or_else(|| std::env::consts::ARCH.to_string());
 
+    let image_tag = image.split_once(':').map(|(_, tag)| tag).unwrap_or("");
+
+    // 宿主 C/C++ 工具链：slim 镜像没有 cc/make，jemalloc/ring/openssl 等真实
+    // 依赖必然在构建脚本阶段失败；slim 变体统一装 build-essential。
+    //
+    // `provision_system_packages = false` 时完全跳过（气隙环境 / 预烘焙镜像）：
+    // 此时缺 C 工具链的后果会推迟到 build script 阶段才暴露，所以这里先
+    // 明确告警一次，避免用户对着 "cc: not found" 猜是不是 Hotpot 的问题。
+    let host_pkgs = if plan.provision_system_packages {
+        match super::cross::host_packages(image_tag) {
+            Ok(pkgs) => pkgs,
+            Err(reason) => {
+                emit_event(
+                    &tx,
+                    &seq,
+                    &plan.build_id,
+                    EventKind::Stderr,
+                    format!("provision build toolchain failed: {reason}"),
+                )
+                .await;
+                return failed(&started, EndReason::SpawnFailed, None);
+            }
+        }
+    } else {
+        if image_tag.contains("slim") {
+            emit_event(
+                &tx,
+                &seq,
+                &plan.build_id,
+                EventKind::Stderr,
+                "system package provisioning disabled; slim images lack cc/make, so \
+                 crates with C code (jemalloc/ring/openssl) will fail in build scripts"
+                    .to_string(),
+            )
+            .await;
+        }
+        Vec::new()
+    };
+
+    // 交叉编译：按目标 triple 准备交叉 C 工具链与 linker；无法自动供给的目标
+    // 在此显式失败，而不是拖到链接阶段才报含糊错误。
+    let cross = match plan.profile.target.as_deref().filter(|_| {
+        // 关闭供给时不做交叉工具链安装；但 wasm32 不需要任何包，保留它。
+        plan.provision_system_packages
+    }) {
+        Some(t) => match super::cross::provision(&arch, image_tag, t) {
+            Ok(prov) => Some((t, prov)),
+            Err(reason) => {
+                emit_event(
+                    &tx,
+                    &seq,
+                    &plan.build_id,
+                    EventKind::Stderr,
+                    format!("cross target '{t}' unsupported: {reason}"),
+                )
+                .await;
+                return failed(&started, EndReason::SpawnFailed, None);
+            }
+        },
+        None => None,
+    };
+
+    // 宿主包 + 交叉包合并去重，交给同一个 apt 步骤安装。
+    let mut packages = host_pkgs;
+    if let Some((_, prov)) = &cross {
+        for pkg in &prov.packages {
+            if !packages.contains(pkg) {
+                packages.push(pkg.clone());
+            }
+        }
+    }
+
     // 挂载源路径（必须绝对路径；macOS colima 下 /tmp、/Users 在 VM 内可见）。
     let project = match plan.project_dir.canonicalize() {
         Ok(p) => p,
@@ -165,8 +233,31 @@ async fn run_inner(
             return failed(&started, EndReason::SpawnFailed, None);
         }
     };
-    std::fs::create_dir_all(&plan.target_dir).ok();
-    let target = match plan.target_dir.canonicalize() {
+    // target 目录：有项目稳定标识时挂载持久化 warm target 卷（复用 cargo
+    // fingerprint 与全部构建脚本产物），否则用本次会话的全新目录。
+    let warm_target = match (&plan.warm_identity, &plan.tools_dir) {
+        (Some(identity), Some(tools_dir)) => {
+            let triple = plan.profile.target.as_deref().unwrap_or("host");
+            let mode = match plan.profile.mode {
+                hotpot_core::BuildMode::Debug => "debug",
+                hotpot_core::BuildMode::Release => "release",
+            };
+            let key = super::warmcache::key(identity, image_tag, triple, mode);
+            Some(super::warmcache::dir(tools_dir, &key))
+        }
+        _ => None,
+    };
+    let target = match &warm_target {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).ok();
+            dir.clone()
+        }
+        None => {
+            std::fs::create_dir_all(&plan.target_dir).ok();
+            plan.target_dir.clone()
+        }
+    };
+    let target = match target.canonicalize() {
         Ok(p) => p,
         Err(e) => {
             emit_event(
@@ -234,7 +325,7 @@ async fn run_inner(
         let bin = sccache_container_bin
             .or(plan.sccache_bin.as_deref())
             .or_else(|| cache_dir.map(|_| Path::new("sccache")));
-        cargo_invocation(toolchain.as_ref(), &plan.profile, cache_dir, bin)
+        cargo_invocation(None, &plan.profile, cache_dir, bin)
     };
 
     let mut binds = vec![
@@ -250,11 +341,40 @@ async fn run_inner(
     if let Some(dir) = &cargo_home {
         binds.push(format!("{}:{CARGO_HOME_MOUNT}", dir.display()));
     }
+    // 系统包（宿主 build-essential + 交叉工具链）与目标 rustlib 的持久化缓存，
+    // 挂在 tools 目录下；warm 构建跳过 apt 下载/索引与 rustup target 下载。
+    let mut rustlib_cache = false;
+    if let Some(tools_dir) = &plan.tools_dir {
+        if !packages.is_empty() {
+            let dir = tools_dir.join("apt-archives");
+            std::fs::create_dir_all(&dir).ok();
+            if let Ok(dir) = dir.canonicalize() {
+                binds.push(format!("{}:/var/cache/apt/archives", dir.display()));
+            }
+            // apt 索引列表持久化（跳过 warm 构建的 apt-get update）。
+            let dir = tools_dir.join("apt-lists");
+            std::fs::create_dir_all(&dir).ok();
+            if let Ok(dir) = dir.canonicalize() {
+                binds.push(format!("{}:/var/lib/apt/lists", dir.display()));
+            }
+        }
+        if cross.is_some() {
+            let dir = tools_dir.join("rustlib-cache");
+            std::fs::create_dir_all(&dir).ok();
+            if dir.canonicalize().is_ok() {
+                binds.push(format!("{}:/opt/rustlib-cache", dir.display()));
+                rustlib_cache = true;
+            }
+        }
+    }
 
     let env = {
         let mut vars = vec![format!("CARGO_TARGET_DIR={TARGET_MOUNT}")];
         vars.extend(extra_env.iter().map(|(k, v)| format!("{k}={v}")));
         vars.extend(plan.extra_env.iter().map(|(k, v)| format!("{k}={v}")));
+        if let Some((_, prov)) = &cross {
+            vars.extend(prov.env.iter().map(|(k, v)| format!("{k}={v}")));
+        }
         if cargo_home.is_some() {
             vars.push(format!("CARGO_HOME={CARGO_HOME_MOUNT}"));
         }
@@ -266,39 +386,23 @@ async fn run_inner(
         plan.build_id,
         started.elapsed().as_nanos()
     );
-    // 需要容器内预处理时把入口换成 shell（否则直接 exec cargo）：
-    // - 指定 toolchain：官方镜像预装的工具链名是「精确版本+host triple」，
-    //   `cargo +1.85` 会被 rustup 当作新 spec，触发联网下载最新 1.85.x（镜像
-    //   预热完全失效，每个构建多下数百 MB）。因此把 spec 链接到镜像默认
-    //   工具链；已能用该 spec 直接运行（精确版本/带日期 nightly）则跳过。
-    // - 交叉 target：先装 target 组件再执行 cargo。
+    // Docker 模式下工具链由**镜像选择**决定：镜像的 default toolchain 即请求的
+    // spec（官方镜像用精确版本名预装）。因此容器内一律执行**不带 +spec** 的
+    // cargo——否则 rustup 会把部分 spec（如 `1.85`）当成新 channel，联网下载
+    // 最新 1.85.x，镜像预热完全失效；`rustup toolchain link` 又拒绝版本号别名。
+    //
+    // 交叉 target 需要容器内先装 target 组件（装进 default 工具链），再执行 cargo。
     let mut cmd: Vec<String> = std::iter::once("cargo".to_string()).chain(args).collect();
-    let mut setup_steps: Vec<String> = Vec::new();
-    if let Some(tc) = &toolchain {
-        let spec = sh_quote(&tc.rustup_spec());
-        setup_steps.push(format!(
-            "if rustup run {spec} rustc --version >/dev/null 2>&1; then :; else \
-             tc_root=\"$(dirname \"$(dirname \"$(rustup which rustc)\")\"; \
-             rustup toolchain link {spec} \"$tc_root\"; fi"
-        ));
-    }
-    if let Some(target) = plan.profile.target.as_deref() {
-        let mut step = String::from("rustup target add");
-        if let Some(tc) = &toolchain {
-            step.push_str(" --toolchain ");
-            step.push_str(&sh_quote(&tc.rustup_spec()));
-        }
-        step.push(' ');
-        step.push_str(&sh_quote(target));
-        setup_steps.push(step);
-    }
-    if !setup_steps.is_empty() {
+    // 需要容器内预处理（装系统包 / 准备目标 rustlib）时，改为 shell 入口。
+    let rustlib = cross.as_ref().map(|(target, _)| (*target, rustlib_cache));
+    let setup = super::cross::setup_script(&packages, rustlib);
+    if !setup.is_empty() {
         let quoted = cmd
             .iter()
             .map(|part| sh_quote(part))
             .collect::<Vec<_>>()
             .join(" ");
-        let script = format!("{} && exec {quoted}", setup_steps.join(" && "));
+        let script = format!("{setup} && exec {quoted}");
         cmd = vec!["sh".to_string(), "-c".to_string(), script];
     }
 
@@ -446,6 +550,20 @@ async fn run_inner(
     let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
     let success = exit_code == Some(0);
     remove_container(&docker, &id).await;
+
+    // warm target LRU 回收（同步磁盘遍历，放 blocking）；GC 失败不影响构建结果。
+    if let Some(tools_dir) = &plan.tools_dir {
+        let root = tools_dir.join("warm-targets");
+        let reclaim = tokio::task::spawn_blocking(move || {
+            super::warmcache::enforce_quota(&root, super::warmcache::DEFAULT_QUOTA)
+        })
+        .await;
+        if let Ok(Ok(bytes)) = reclaim
+            && bytes > 0
+        {
+            tracing::info!("warm target LRU reclaimed {bytes} bytes");
+        }
+    }
 
     let build_ms = started.elapsed().as_millis() as u64;
     BuildResult {
@@ -685,76 +803,4 @@ fn sh_quote(s: &str) -> String {
     }
     out.push('\'');
     out
-}
-
-/// 官方 `rust` 镜像按工具链换版本段：`rust:1.98-slim-bookworm` + `1.99.0`
-/// → `rust:1.99.0-slim-bookworm`。非官方镜像（或标签形状不符）返回 None，
-/// 由调用方显式报错，而不是静默用错工具链。
-fn resolve_image(image: &str, toolchain: &hotpot_core::ToolchainRequest) -> Option<String> {
-    let (repo, tag) = image.split_once(':')?;
-    if repo != "rust" {
-        return None;
-    }
-    // 标签形如 `1.98-slim-bookworm` / `stable-slim` / `slim-bookworm`（无版本段）。
-    // 变体推导必须只剥离**工具链版本段**：`slim-bookworm` 首段 "slim" 不是版本，
-    // 按首个 '-' 切会误得变体 "bookworm"（拉成无 slim 的数 GB 全量镜像）。
-    let spec_prefix = format!("{}-", toolchain.rustup_spec());
-    let variant = tag
-        .strip_prefix(&spec_prefix)
-        .unwrap_or_else(|| match tag.split_once('-') {
-            Some((head, rest)) if hotpot_core::parse_toolchain(head).is_ok() => rest,
-            _ => tag,
-        });
-    Some(toolchain.docker_tag(variant))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_image;
-    use hotpot_core::parse_toolchain;
-
-    fn resolve(image: &str, spec: &str) -> Option<String> {
-        resolve_image(image, &parse_toolchain(spec).unwrap())
-    }
-
-    #[test]
-    fn bare_variant_tag_is_kept_whole() {
-        // 回归：`slim-bookworm` 不是「版本 + 变体」，曾被误切成变体 "bookworm"。
-        assert_eq!(
-            resolve("rust:slim-bookworm", "1.85"),
-            Some("rust:1.85-slim-bookworm".to_string())
-        );
-        assert_eq!(
-            resolve("rust:bookworm", "1.98"),
-            Some("rust:1.98-bookworm".to_string())
-        );
-    }
-
-    #[test]
-    fn versioned_tag_strips_only_version_segment() {
-        assert_eq!(
-            resolve("rust:1.98-slim-bookworm", "1.85"),
-            Some("rust:1.85-slim-bookworm".to_string())
-        );
-        assert_eq!(
-            resolve("rust:stable-slim", "beta"),
-            Some("rust:beta-slim".to_string())
-        );
-    }
-
-    #[test]
-    fn dated_nightly_tag_matches_full_spec() {
-        assert_eq!(
-            resolve(
-                "rust:nightly-2026-01-15-slim-bookworm",
-                "nightly-2026-01-15"
-            ),
-            Some("rust:nightly-2026-01-15-slim-bookworm".to_string())
-        );
-    }
-
-    #[test]
-    fn non_rust_repo_is_rejected() {
-        assert_eq!(resolve("myregistry/rust:slim", "1.85"), None);
-    }
 }

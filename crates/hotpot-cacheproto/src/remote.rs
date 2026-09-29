@@ -40,6 +40,21 @@ pub struct Entry {
     pub meta: ArtifactMeta,
 }
 
+/// 一次缓存写入的元数据。
+///
+/// 与 body 分开成值对象：写入路径上的参数已经够多了。把「大小 + 签名 tag
+/// + turbo 观测头」收成一个结构体，调用点读起来就是一句话的事，也省得每加
+///   一个 header 就动一遍函数签名。
+#[derive(Debug, Clone, Default)]
+pub struct PutMeta {
+    /// 请求声明的 `Content-Length`（可能与实际不符，仅作索引参考）。
+    pub size: Option<i64>,
+    /// 上传时携带的 `x-artifact-tag`（turbo 签名，原样存取）。
+    pub tag: Option<String>,
+    /// Turborepo 观测元数据。
+    pub meta: ArtifactMeta,
+}
+
 /// Turborepo v8 随 artifact 携带的元数据。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactMeta {
@@ -127,6 +142,13 @@ enum CountKind {
 }
 
 const SCHEMA: &str = include_str!("schema.sql");
+
+/// 读取字符串列。
+fn rg_string(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<String> {
+    use sqlx::Row;
+    row.try_get::<String, _>(column)
+        .map_err(|e| Error::Other(format!("read column {column}: {e}")))
+}
 
 /// 幂等迁移：为已存在的库补齐后加的列（SQLite 无 `ADD COLUMN IF NOT EXISTS`，
 /// 重复执行会报 duplicate column，按错误信息忽略即可）。
@@ -237,6 +259,159 @@ impl RemoteCache {
         .await
         .map_err(|e| Error::Other(format!("insert kv entry: {e}")))?;
         Ok(digest)
+    }
+
+    /// 流式写入：body 从 reader 读入，内容寻址入 CAS 后再登记索引。
+    ///
+    /// 为什么需要它：缓冲版 `put` 要求调用方先把整个 body 读进内存，
+    /// 而一次上传会同时持有「请求缓冲 + CAS 编码缓冲」，GB 级 artifact
+    /// 的内存峰值可达自身大小的数倍。缓存端点的体积上限只防住了
+    /// 「无限大」，没防住「几倍大」。
+    ///
+    /// 幂等语义与 `put` 一致：同 key 已存在时不覆盖 body，只补齐 tag/元数据。
+    pub async fn put_reader<R: std::io::Read + Send + 'static>(
+        &self,
+        ns: Namespace,
+        key: &str,
+        tenant: &str,
+        reader: R,
+        put: PutMeta,
+    ) -> Result<ContentDigest> {
+        // 两条分支都要「消费 body」，其中一条是丢弃；用 Option 表达这一点，
+        // 而不是靠分支里的 move 体操。
+        let mut reader = Some(reader);
+        let PutMeta { size, tag, meta } = put;
+        // 已有条目：body 不动，只补齐缺失的 tag / 元数据。
+        if let Some(existing) = self.lookup(ns, key, tenant).await? {
+            // **必须先把请求体消费完**再应答。提前返回会让客户端在仍在上传时
+            // 收到响应并判定为传输失败：curl 报传输错误，而 turbo 会在连接错误
+            // 时**重试 PUT**，于是每次重试都再触发一次「提前应答」——把一次幂等
+            // 命中放大成持续的失败流量。
+            //
+            // 丢弃也要放到 blocking 线程里：`BodyReader::read` 内部是
+            // `blocking_recv`，在 async 线程上调用会 panic。
+            if let Some(reader) = reader.take() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut reader = reader;
+                    if let Err(e) = std::io::copy(&mut reader, &mut std::io::sink()) {
+                        tracing::debug!("drain request body for existing key failed: {e}");
+                    }
+                })
+                .await;
+            }
+            self.backfill_meta(ns, key, tenant, tag, meta).await?;
+            return Ok(existing);
+        }
+        let reader = reader
+            .take()
+            .expect("reader is consumed on exactly one path");
+
+        // 大对象在 spawn_blocking 里写：zstd + 磁盘 IO 都是同步的，
+        // 绝不能占住 async worker 线程。
+        let store = self.store.clone();
+        let digest = tokio::task::spawn_blocking(move || store.put_reader(reader))
+            .await
+            .map_err(|e| Error::Other(format!("put_reader task panicked: {e}")))??;
+
+        self.stats.count(ns, CountKind::Put);
+        let logical_size =
+            size.unwrap_or_else(|| self.store.object_size(&digest).unwrap_or(0) as i64);
+        sqlx::query(
+            "INSERT OR REPLACE INTO kv_entries (namespace, tenant, cache_key, digest, size, tag, \
+             duration_ms, sha, dirty_hash, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind(ns.as_str())
+        .bind(tenant)
+        .bind(key)
+        .bind(digest.to_hex())
+        .bind(logical_size)
+        .bind(tag)
+        .bind(meta.duration_ms)
+        .bind(meta.sha)
+        .bind(meta.dirty_hash)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::Other(format!("insert kv entry: {e}")))?;
+        Ok(digest)
+    }
+
+    /// 只查索引拿到条目的逻辑大小（未命中 None），不读对象内容。
+    ///
+    /// 用于 HEAD：需要给出真实 `Content-Length`，但没必要把对象读进内存。
+    pub async fn peek(&self, ns: Namespace, key: &str, tenant: &str) -> Result<Option<u64>> {
+        let row = sqlx::query(
+            "SELECT size FROM kv_entries WHERE namespace = ?1 AND tenant = ?2 AND cache_key = ?3",
+        )
+        .bind(ns.as_str())
+        .bind(tenant)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Error::Other(format!("peek kv: {e}")))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        use sqlx::Row;
+        let size: i64 = row.try_get("size").unwrap_or(0);
+        Ok(Some(size.max(0) as u64))
+    }
+
+    /// 打开条目用于流式读取（未命中 None）。
+    ///
+    /// 调用方拿到的是 store 层的 `ObjectReader`：内存 O(1)，
+    /// 摘要在 EOF 校验。`size` 来自索引，用于直接填 `Content-Length`，
+    /// 无需把对象读进内存就能算出来。
+    pub async fn open_entry(
+        &self,
+        ns: Namespace,
+        key: &str,
+        tenant: &str,
+    ) -> Result<
+        Option<(
+            Box<dyn std::io::Read + Send>,
+            u64,
+            Option<String>,
+            ArtifactMeta,
+        )>,
+    > {
+        let row = sqlx::query(
+            "SELECT digest, size, tag, duration_ms, sha, dirty_hash FROM kv_entries \
+             WHERE namespace = ?1 AND tenant = ?2 AND cache_key = ?3",
+        )
+        .bind(ns.as_str())
+        .bind(tenant)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Error::Other(format!("lookup entry: {e}")))?;
+        let Some(row) = row else {
+            self.stats.count(ns, CountKind::Miss);
+            return Ok(None);
+        };
+        use sqlx::Row;
+        let digest = ContentDigest::from_hex(&rg_string(&row, "digest")?)
+            .map_err(|e| Error::Other(format!("bad digest in index: {e}")))?;
+        let size: i64 = row.try_get("size").unwrap_or(0);
+        let tag: Option<String> = row.try_get("tag").unwrap_or(None);
+        let meta = ArtifactMeta {
+            duration_ms: row.try_get("duration_ms").unwrap_or(None),
+            sha: row.try_get("sha").unwrap_or(None),
+            dirty_hash: row.try_get("dirty_hash").unwrap_or(None),
+        };
+        match self.store.reader(&digest)? {
+            Some(reader) => {
+                self.stats.count(ns, CountKind::Hit);
+                Ok(Some((Box::new(reader), size.max(0) as u64, tag, meta)))
+            }
+            // 索引指向的 CAS 对象丢失：清悬挂索引并按未命中处理。
+            None => {
+                self.forget(ns, key, tenant).await?;
+                self.stats.count(ns, CountKind::Miss);
+                Ok(None)
+            }
+        }
     }
 
     /// 已有条目：仅用 COALESCE 补齐缺失的 tag / 元数据，不改动 body 与 digest。

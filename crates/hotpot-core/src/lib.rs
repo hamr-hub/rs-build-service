@@ -7,11 +7,11 @@ pub mod ids;
 pub mod model;
 pub mod toolchain;
 
-pub use digest::ContentDigest;
+pub use digest::{ContentDigest, Hasher};
 pub use error::{Error, Result};
 pub use ids::{BuildId, ProjectId};
 pub use model::{
     ArtifactMeta, BuildEvent, BuildMode, BuildProfile, BuildRecord, BuildStatus, BuildTimings,
     EventKind, SourceSpec,
 };
-pub use toolchain::{ToolchainChannel, ToolchainRequest, parse_toolchain};
+pub use toolchain::{ToolchainChannel, ToolchainRequest, parse_toolchain, resolve_rust_image};

@@ -24,6 +24,8 @@ pub struct AppState {
     pub allow_git_source: bool,
     /// 内嵌 worker 数（`/metrics` 暴露）。
     pub workers: usize,
+    /// 资源回收器的累计计数（`/metrics` 暴露）。
+    pub gc_stats: Arc<crate::gc::GcStats>,
     /// 构建默认使用的工具链描述（`/metrics` 的 `hotpot_info` 标签）。
     pub default_toolchain: String,
     /// 运行中构建的取消信号通道（构建结束即移除）。
@@ -39,6 +41,7 @@ impl AppState {
             executor: Arc::new(ExecutorKind::default()),
             allow_git_source: false,
             workers: 0,
+            gc_stats: Arc::new(crate::gc::GcStats::default()),
             default_toolchain: "default".to_string(),
             cancels: Arc::new(Mutex::new(HashMap::new())),
         }

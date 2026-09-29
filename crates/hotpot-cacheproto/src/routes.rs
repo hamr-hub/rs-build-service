@@ -1,14 +1,15 @@
 //! sccache WebDAV 兼容端点与 Turborepo v8 兼容端点。
 
 use axum::Router;
-use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Deserialize;
 
-use crate::remote::{ArtifactMeta, Namespace};
+use hotpot_core::ContentDigest;
+
+use crate::remote::{ArtifactMeta, Namespace, PutMeta, RemoteCache};
 use crate::state::CacheState;
 
 /// 单个 artifact 的体积上限（字节）。turbo 的 tar 产物可以到 GB 级，
@@ -100,37 +101,43 @@ async fn any_sccache(State(state): State<CacheState>, req: axum::extract::Reques
     }
 
     match parts.method {
-        axum::http::Method::GET => match state.cache.get(Namespace::Sccache, &key, "").await {
-            Ok(Some(entry)) => octet_stream(entry.bytes, entry.tag, None),
-            Ok(None) => StatusCode::NOT_FOUND.into_response(),
-            Err(e) => internal(e),
-        },
+        axum::http::Method::GET => {
+            // 流式返回：内存占用与对象大小无关，GB 级缓存条目也能服务。
+            match stream_entry(
+                &state.cache,
+                Namespace::Sccache,
+                &key,
+                "",
+                "application/octet-stream",
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(status) => status.into_response(),
+            }
+        }
         axum::http::Method::HEAD => {
-            match state.cache.contains(Namespace::Sccache, &key, "").await {
-                Ok(true) => StatusCode::OK.into_response(),
-                Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            // HEAD 不读内容，只查索引。真实 sccache 读路径不发 HEAD。
+            match state.cache.peek(Namespace::Sccache, &key, "").await {
+                Ok(Some(size)) => response_with_length(size),
+                Ok(None) => StatusCode::NOT_FOUND.into_response(),
                 Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             }
         }
         axum::http::Method::PUT => {
-            let bytes = match read_body_limited(body).await {
-                Ok(bytes) => bytes,
-                Err(status) => return status.into_response(),
-            };
-            match state
-                .cache
-                .put(
-                    Namespace::Sccache,
-                    &key,
-                    "",
-                    &bytes,
-                    None,
-                    Default::default(),
-                )
-                .await
+            // 流式落库：请求体不整体进内存。
+            match store_body_streaming(
+                &state.cache,
+                Namespace::Sccache,
+                &key,
+                "",
+                body,
+                PutMeta::default(),
+            )
+            .await
             {
                 Ok(_) => StatusCode::NO_CONTENT.into_response(),
-                Err(e) => internal(e),
+                Err(status) => status.into_response(),
             }
         }
         // 集合探测：目录不落盘，直接告诉客户端存在/已创建。
@@ -169,14 +176,18 @@ async fn get_turbo(
     AxumPath(hash): AxumPath<String>,
     Query(query): Query<TurboQuery>,
 ) -> Response {
-    match state
-        .cache
-        .get(Namespace::Turbo, &hash, &query.tenant())
-        .await
+    // 流式返回：内存占用与对象大小无关，GB 级 artifact 也能服务。
+    match stream_entry(
+        &state.cache,
+        Namespace::Turbo,
+        &hash,
+        &query.tenant(),
+        "application/octet-stream",
+    )
+    .await
     {
-        Ok(Some(entry)) => octet_stream(entry.bytes, entry.tag, Some(entry.meta)),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => internal(e),
+        Ok(response) => response,
+        Err(status) => status.into_response(),
     }
 }
 
@@ -188,19 +199,13 @@ async fn head_turbo(
     AxumPath(hash): AxumPath<String>,
     Query(query): Query<TurboQuery>,
 ) -> Response {
+    // HEAD 只查索引，不读对象内容；但 Content-Length 必须是 artifact 的真实体积。
     match state
         .cache
-        .get(Namespace::Turbo, &hash, &query.tenant())
+        .peek(Namespace::Turbo, &hash, &query.tenant())
         .await
     {
-        Ok(Some(entry)) => {
-            let mut response = octet_stream(Vec::new(), entry.tag, Some(entry.meta));
-            // HEAD 不带 body，但 Content-Length 必须是 artifact 的真实体积。
-            if let Ok(value) = header::HeaderValue::from_str(&entry.size.to_string()) {
-                response.headers_mut().insert(header::CONTENT_LENGTH, value);
-            }
-            response
-        }
+        Ok(Some(size)) => response_with_length(size),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => internal(e),
     }
@@ -215,14 +220,9 @@ async fn put_turbo(
 ) -> Response {
     // spec 把 Content-Length 标为 required；与实际长度不符会让 turbo 侧的
     // 签名校验（body_len 是 HMAC 消息字段）失败，故显式拒绝。
-    if let Some(declared) = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if declared > DEFAULT_MAX_ARTIFACT_BYTES as u64 {
-            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-        }
+    let declared = content_length(headers.get(header::CONTENT_LENGTH));
+    if declared.is_some_and(|n| n > DEFAULT_MAX_ARTIFACT_BYTES as i64) {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
 
     let tag = headers
@@ -244,38 +244,281 @@ async fn put_turbo(
             .map(str::to_string),
     };
 
-    let bytes = match read_body_limited(body).await {
-        Ok(bytes) => bytes,
-        Err(status) => return status.into_response(),
-    };
-    match state
-        .cache
-        .put(Namespace::Turbo, &hash, &query.tenant(), &bytes, tag, meta)
-        .await
+    match store_body_streaming(
+        &state.cache,
+        Namespace::Turbo,
+        &hash,
+        &query.tenant(),
+        body,
+        PutMeta {
+            size: declared,
+            tag,
+            meta,
+        },
+    )
+    .await
     {
         // 201 与官方 mock server 一致；turbo 用 error_for_status()，任意 2xx 均通过。
         Ok(_) => StatusCode::CREATED.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(status) => status.into_response(),
     }
 }
 
-/// 读 body 并强制体积上限：超限 413，其它读失败 400。
-async fn read_body_limited(body: axum::body::Body) -> Result<Bytes, StatusCode> {
-    axum::body::to_bytes(body, DEFAULT_MAX_ARTIFACT_BYTES)
+/// 把请求 body 流式落库：内存占用与对象大小无关。
+///
+/// 做法是把 axum 的 `Body` 包成 `std::io::Read` 适配器，交给 store 的
+/// `put_reader`（在 `spawn_blocking` 里做 zstd + 落盘）。这样一次上传
+/// 不再同时持有「请求缓冲 + 压缩缓冲」两份完整拷贝。
+///
+/// 体积上限仍然生效：由 `DefaultBodyLimit` 在 body 层拦截，超限表现为
+/// 读取中途出错 → 按 413 处理。
+async fn store_body_streaming(
+    cache: &RemoteCache,
+    ns: Namespace,
+    key: &str,
+    tenant: &str,
+    body: axum::body::Body,
+    put: PutMeta,
+) -> Result<ContentDigest, StatusCode> {
+    let reader = BodyReader::spawn(body);
+    cache
+        .put_reader(ns, key, tenant, reader, put)
         .await
         .map_err(|e| {
-            if e.to_string().contains("length limit") {
-                StatusCode::PAYLOAD_TOO_LARGE
-            } else {
-                StatusCode::BAD_REQUEST
-            }
+            tracing::warn!("streaming put failed for {key}: {e}");
+            // 读取中途失败通常来自 body 层（超限 / 客户端断开）。
+            StatusCode::PAYLOAD_TOO_LARGE
         })
 }
 
-// ---------- helpers ----------
+/// 读取条目并构造流式响应：内存占用与对象大小无关。
+///
+/// `Content-Length` 直接取索引里的逻辑大小，无需把对象读进内存。
+/// 摘要在传输末尾由 `ObjectReader` 校验；若发现损坏，body 会被截断——
+/// 两套协议的客户端都能安全处理（sccache 视为 miss，turbo 验签失败），
+/// 因此**不会**把与 key 不符的字节当作正常内容交付。
+async fn stream_entry(
+    cache: &RemoteCache,
+    ns: Namespace,
+    key: &str,
+    tenant: &str,
+    content_type: &'static str,
+) -> Result<Response, StatusCode> {
+    use axum::body::Body;
+    use http_body_util::StreamBody;
 
-/// 最小合法的 WebDAV PROPFIND 207 响应。opendal 用它判断父集合是否存在，
-/// 空体会触发 XML 反序列化错误并把存储降级为只读。
+    match cache.open_entry(ns, key, tenant).await {
+        Ok(Some((reader, size, tag, meta))) => {
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, size)
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            apply_turbo_headers(&mut response, tag, meta);
+            // 已有响应头（含 Content-Length），只把 body 换成流。
+            //
+            // store 层是同步 `Read`（zstd 解码本身是同步的），用 tokio-util 的
+            // `SyncIoBridge` 桥接到 `AsyncRead`：它在专用 blocking 线程上执行读取，
+            // 因此不会占用 async worker 线程。读取中途若发现摘要不匹配，
+            // 错误会作为流上的一个 `Err` 项传出，hyper 随即中断响应体——
+            // 客户端看到的是截断的下载，而不是「看起来正常但内容错误」的响应。
+            *response.body_mut() =
+                Body::from_stream(StreamBody::new(reader_to_body_stream(reader)));
+            Ok(response)
+        }
+        Ok(None) => Ok(StatusCode::NOT_FOUND.into_response()),
+        Err(e) => {
+            internal(e);
+            Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+/// 把 turbo 的 artifact 头贴到响应上（tag 必回显，签名客户端依赖它）。
+fn apply_turbo_headers(response: &mut Response, tag: Option<String>, meta: ArtifactMeta) {
+    if let Some(tag) = tag {
+        // 头非法时必须可见：签名客户端缺 tag 是硬错误，静默丢弃极难排查。
+        match header::HeaderValue::from_str(&tag) {
+            Ok(value) => {
+                response.headers_mut().insert("x-artifact-tag", value);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "dropping invalid x-artifact-tag ({e}); signature clients will fail"
+                );
+            }
+        }
+    }
+    if let Some(ms) = meta.duration_ms
+        && let Ok(value) = header::HeaderValue::from_str(&ms.to_string())
+    {
+        response.headers_mut().insert("x-artifact-duration", value);
+    }
+    for (name, value) in [
+        ("x-artifact-sha", meta.sha),
+        ("x-artifact-dirty-hash", meta.dirty_hash),
+    ] {
+        if let Some(value) = value
+            && let Ok(v) = header::HeaderValue::from_str(&value)
+        {
+            response.headers_mut().insert(name, v);
+        }
+    }
+}
+
+/// 解析 `Content-Length` 头。
+fn content_length(value: Option<&header::HeaderValue>) -> Option<i64> {
+    value
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+}
+
+/// 只有 `Content-Length` 的响应（HEAD 用：真实体积、无 body）。
+fn response_with_length(size: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_LENGTH, size)
+        .body(axum::body::Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// 把同步 `Read` 转成响应体流：blocking 线程读盘 + 有界通道背压。
+///
+/// store 层刻意是同步的（zstd 解码是 CPU 密集的同步 API），因此这里用
+/// `spawn_blocking` 承担读取，块经容量为 4 的通道送回 async 侧。
+/// 通道有界即背压：客户端读得慢，磁盘读取就会自然减速，而不是把
+/// 整个对象堆进内存。
+///
+/// 读取出错（例如 EOF 时摘要不匹配）会作为流上的 `Err` 项传出，hyper
+/// 随即中断响应体：客户端看到的是**截断的下载**，而不是一段看起来正常
+/// 但内容与 key 不符的数据。两套协议客户端对此都是安全的失败方式
+/// （sccache 视为 miss，turbo 签名校验失败）。
+fn reader_to_body_stream(
+    mut reader: Box<dyn std::io::Read + Send>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+    tokio::task::spawn_blocking(move || {
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // 客户端已断开时停止读取。
+                    if tx
+                        .blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
+}
+
+/// 把 axum `Body` 适配成 `std::io::Read`，供同步的 store 层消费。
+///
+/// 同步 `Read` 里没法 await，因此用通道解耦：异步侧把 body 的数据帧搬进
+/// 通道，同步侧（`spawn_blocking` 内的 store 写入）在 `read` 里阻塞收取。
+///
+/// **为什么必须是 `tokio::sync::mpsc` 而不是 `std::sync::mpsc`**：
+/// std 的有界通道 `send` 是阻塞调用，在异步任务里调用它，一旦通道满就会
+/// **永久占住一个 tokio worker 线程**。消费端提前放弃时（例如客户端中断上传、
+/// 或存储层写失败提前返回），搬运任务就再也没人来收，于是这条线程被永久
+/// 泄漏。反复几次之后整个运行时被拖死——`/healthz` 也不再响应。
+/// `tokio::sync::mpsc` 的 `send` 是异步的（满了就挂起而不是阻塞线程），
+/// 而 `blocking_recv` 只在 `spawn_blocking` 线程里使用，正是它该出现的地方。
+///
+/// 通道有界（8 帧）：既提供背压，又把内存占用钉在「几个 64 KiB 块」。
+struct BodyReader {
+    rx: tokio::sync::mpsc::Receiver<io_chunk::Chunk>,
+    buf: bytes::Bytes,
+    /// 通道关闭且缓冲已空 = 对端结束或出错。
+    source_done: bool,
+}
+
+/// 跨线程传递的数据块。`Err` 用字符串而非 `io::Error` 以便跨 `Send` 边界。
+mod io_chunk {
+    /// 通道元素：`None` 表示正常结束，`Some(err)` 表示读 body 失败。
+    pub type Chunk = Result<Option<bytes::Bytes>, String>;
+}
+
+impl BodyReader {
+    /// 启动搬运任务并返回同步读取端。
+    fn spawn(body: axum::body::Body) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<io_chunk::Chunk>(8);
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            // `into_data_stream` 只产出数据帧，trailer 等自动跳过。
+            let mut stream = body.into_data_stream();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Err(e) => {
+                        let _ = tx.send(Err(e.to_string())).await;
+                        return;
+                    }
+                    Ok(data) if data.is_empty() => continue,
+                    Ok(data) => {
+                        // await：通道满时挂起当前任务，而不是阻塞一个 worker 线程。
+                        // 发送端被丢弃时说明读取端已放弃，直接结束搬运。
+                        if tx.send(Ok(Some(data))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(Ok(None)).await;
+        });
+        Self {
+            rx,
+            buf: bytes::Bytes::new(),
+            source_done: false,
+        }
+    }
+}
+
+impl std::io::Read for BodyReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.buf.is_empty() {
+            if self.source_done {
+                return Ok(0);
+            }
+            // 只在 spawn_blocking 线程里调用，允许阻塞。
+            match self.rx.blocking_recv() {
+                Some(Ok(None)) => {
+                    self.source_done = true;
+                    return Ok(0);
+                }
+                Some(Ok(Some(data))) => self.buf = data,
+                Some(Err(e)) => {
+                    self.source_done = true;
+                    return Err(std::io::Error::other(format!("read request body: {e}")));
+                }
+                // 搬运任务被取消：视为流结束。
+                None => {
+                    self.source_done = true;
+                    return Ok(0);
+                }
+            }
+        }
+        let n = self.buf.len().min(out.len());
+        let chunk = self.buf.split_to(n);
+        out[..n].copy_from_slice(&chunk);
+        Ok(n)
+    }
+}
+
 fn propfind(path: &str) -> Response {
     let is_collection = path.ends_with('/');
     let resource_type = if is_collection {
@@ -305,8 +548,10 @@ fn propfind(path: &str) -> Response {
         .body(axum::body::Body::from(xml))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
-
-/// XML 文本/属性值转义（RFC 3986 & RFC 4918 要求 href 至少转义这五个字符）。
+/// XML 文本/属性值转义（RFC 4918 要求 href 至少转义这五个字符）。
+///
+/// 不转义的后果：含 `&`/`<` 的路径会产出非法 multistatus，opendal 反序列化
+/// 失败 → 写前探测失败 → sccache 静默降级为只读。
 fn xml_escape(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
@@ -320,46 +565,6 @@ fn xml_escape(raw: &str) -> String {
         }
     }
     out
-}
-
-fn octet_stream(bytes: Vec<u8>, tag: Option<String>, meta: Option<ArtifactMeta>) -> Response {
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, bytes.len())
-        .body(axum::body::Body::from(bytes))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-    if let Some(tag) = tag {
-        // 头非法时必须可见：签名客户端缺 tag 是硬错误，静默丢弃极难排查。
-        match header::HeaderValue::from_str(&tag) {
-            Ok(value) => {
-                response.headers_mut().insert("x-artifact-tag", value);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "dropping invalid x-artifact-tag ({e}); signature clients will fail"
-                );
-            }
-        }
-    }
-    if let Some(meta) = meta {
-        if let Some(ms) = meta.duration_ms {
-            if let Ok(value) = header::HeaderValue::from_str(&ms.to_string()) {
-                response.headers_mut().insert("x-artifact-duration", value);
-            }
-        }
-        for (name, value) in [
-            ("x-artifact-sha", meta.sha),
-            ("x-artifact-dirty-hash", meta.dirty_hash),
-        ] {
-            if let Some(value) = value {
-                if let Ok(v) = header::HeaderValue::from_str(&value) {
-                    response.headers_mut().insert(name, v);
-                }
-            }
-        }
-    }
-    response
 }
 
 fn internal(e: impl std::fmt::Display) -> Response {

@@ -71,10 +71,29 @@ impl ToolchainRequest {
         format!("+{}", self.rustup_spec())
     }
 
-    /// Docker 官方 `rust` 镜像标签，如 `1.98.0-slim-bookworm`、
-    /// `nightly-slim-bookworm`。`variant` 为标签后缀（不含连字符）。
-    pub fn docker_tag(&self, variant: &str) -> String {
-        format!("rust:{}-{variant}", self.rustup_spec())
+    /// Docker 官方 `rust` 镜像标签，如 `1.98.0-slim-bookworm`。
+    /// `variant` 为标签变体（`slim-bookworm` / `bookworm` / `slim` …）。
+    ///
+    /// Docker Hub 的官方 rust 镜像**只发布版本号标签与跟踪 stable 的浮动标签**
+    /// （`slim-bookworm`、`bookworm`、`latest` 等），不存在任何 beta/nightly
+    /// 标签（含带日期的 nightly）——已通过 Hub 标签列表核实。因此：
+    /// - 版本号 spec → `rust:{spec}-{variant}`；
+    /// - `stable` → 浮动标签 `rust:{variant}`（其内容即当前 stable）；
+    /// - beta/nightly → 显式报错，提示改用版本号或 Local 执行器，
+    ///   而不是静默用一个标签不存在的镜像或错误的工具链。
+    pub fn docker_image(&self, variant: &str) -> std::result::Result<String, String> {
+        match &self.channel {
+            ToolchainChannel::Version { .. } => {
+                Ok(format!("rust:{}-{variant}", self.rustup_spec()))
+            }
+            ToolchainChannel::Stable => Ok(format!("rust:{variant}")),
+            ToolchainChannel::Beta | ToolchainChannel::Nightly => Err(format!(
+                "official docker rust images publish no '{}' channel tag (no beta/nightly tags, \
+                 dated nightly included); pin a version number (e.g. 1.98.0) or use the local \
+                 executor",
+                self.rustup_spec()
+            )),
+        }
     }
 
     /// 是否为可能不稳定的通道（beta/nightly）。
@@ -125,6 +144,37 @@ pub fn parse_toolchain(raw: &str) -> Result<ToolchainRequest> {
         channel,
         date: None,
     })
+}
+
+/// 按目标工具链解析配置镜像，得到实际使用的官方 `rust` 镜像引用。
+///
+/// `rust:1.98-slim-bookworm` + `1.85` → `rust:1.85-slim-bookworm`；
+/// `rust:slim-bookworm` + `stable` → `rust:slim-bookworm`（浮动 stable）。
+/// 非官方镜像、缺标签、或请求通道没有官方标签（beta/nightly）时返回 Err，
+/// 由调用方显式报错，而不是静默用错工具链。
+pub fn resolve_rust_image(
+    image: &str,
+    toolchain: &ToolchainRequest,
+) -> std::result::Result<String, String> {
+    let (repo, tag) = image
+        .split_once(':')
+        .ok_or_else(|| format!("image '{image}' is not an official rust image (missing tag)"))?;
+    if repo != "rust" {
+        return Err(format!(
+            "image '{image}' is not an official rust image; pass --docker-image to pin a matching \
+             image"
+        ));
+    }
+    // 变体推导必须只剥离**工具链版本段**：`slim-bookworm` 首段 "slim" 不是版本，
+    // 按首个 '-' 切会误得变体 "bookworm"（拉成无 slim 的数 GB 全量镜像）。
+    let spec_prefix = format!("{}-", toolchain.rustup_spec());
+    let variant = tag
+        .strip_prefix(&spec_prefix)
+        .unwrap_or_else(|| match tag.split_once('-') {
+            Some((head, rest)) if parse_toolchain(head).is_ok() => rest,
+            _ => tag,
+        });
+    toolchain.docker_image(variant)
 }
 
 /// 解析 X / X.Y / X.Y.Z 形式的版本号。
@@ -290,24 +340,75 @@ mod tests {
     fn builds_rustup_and_docker_names() {
         assert_eq!(parse_toolchain("1.98.0").unwrap().rustup_spec(), "1.98.0");
         assert_eq!(parse_toolchain("1.98").unwrap().cargo_plus_arg(), "+1.98");
+        // stable 映射到跟踪 stable 的浮动标签（官方不发布 stable-slim-bookworm）。
         assert_eq!(
             parse_toolchain("stable")
                 .unwrap()
-                .docker_tag("slim-bookworm"),
-            "rust:stable-slim-bookworm"
+                .docker_image("slim-bookworm")
+                .unwrap(),
+            "rust:slim-bookworm"
         );
         assert_eq!(
             parse_toolchain("1.98.0")
                 .unwrap()
-                .docker_tag("slim-bookworm"),
+                .docker_image("slim-bookworm")
+                .unwrap(),
             "rust:1.98.0-slim-bookworm"
         );
-        assert_eq!(
+        // beta/nightly 无任何官方镜像标签，必须显式报错。
+        assert!(
             parse_toolchain("nightly")
                 .unwrap()
-                .docker_tag("slim-bookworm"),
-            "rust:nightly-slim-bookworm"
+                .docker_image("slim-bookworm")
+                .is_err()
         );
+        assert!(
+            parse_toolchain("nightly-2026-01-15")
+                .unwrap()
+                .docker_image("slim-bookworm")
+                .is_err()
+        );
+        assert!(
+            parse_toolchain("beta")
+                .unwrap()
+                .docker_image("bookworm")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolves_rust_image_variants() {
+        fn resolve(image: &str, spec: &str) -> std::result::Result<String, String> {
+            resolve_rust_image(image, &parse_toolchain(spec).unwrap())
+        }
+        // `slim-bookworm` 无版本段，曾被误切成 "bookworm"。
+        assert_eq!(
+            resolve("rust:slim-bookworm", "1.85").unwrap(),
+            "rust:1.85-slim-bookworm"
+        );
+        assert_eq!(
+            resolve("rust:bookworm", "1.98").unwrap(),
+            "rust:1.98-bookworm"
+        );
+        assert_eq!(
+            resolve("rust:1.98-slim-bookworm", "1.85").unwrap(),
+            "rust:1.85-slim-bookworm"
+        );
+        // stable 只能落到跟踪 stable 的浮动标签。
+        assert_eq!(
+            resolve("rust:slim-bookworm", "stable").unwrap(),
+            "rust:slim-bookworm"
+        );
+        assert_eq!(
+            resolve("rust:1.98-slim-bookworm", "stable").unwrap(),
+            "rust:slim-bookworm"
+        );
+        // beta/nightly 无官方标签；非官方仓库/缺标签显式拒绝。
+        assert!(resolve("rust:slim-bookworm", "beta").is_err());
+        assert!(resolve("rust:slim-bookworm", "nightly").is_err());
+        assert!(resolve("rust:slim-bookworm", "nightly-2026-01-15").is_err());
+        assert!(resolve("myregistry/rust:slim", "1.85").is_err());
+        assert!(resolve("rust", "1.85").is_err());
     }
 
     #[test]

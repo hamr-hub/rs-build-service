@@ -92,7 +92,14 @@ BuildEvent（日志/状态事件，带单调序号 seq）
 
 - `CARGO_HOME`：registry 包体、git bare db、sparse index 响应；
 - 固定构建根路径（如 `/workspace/build`）以稳定路径相关指纹；
-- 每构建会话**独立 target 目录**，绝不跨项目共享（静默误编译事故红线）。
+- **warm target 卷**：CARGO_TARGET_DIR 按「项目身份 × 镜像 tag × triple ×
+  mode」键控复用（绝不跨键共享，静默误编译事故红线）；20GiB LRU 配额，
+  30 分钟宽限保护在用目录。sccache 无法缓存 build-script-build / bin /
+  dylib 单元，cargo fingerprint 命中是这些单元唯一的免重编手段；
+- **共享 git 工作区**：同 URL 单一稳定检出路径（部分克隆 + fetch +
+  detached checkout），避免会话路径变化使项目 crate 指纹失效；按 URL 互斥
+  保证同项目构建串行；
+- slim 镜像自动供给 `build-essential`，deb 归档与 apt 索引持久化复用。
 
 ### L1 crate 编译层（sccache 协议，跨主机）
 
@@ -127,10 +134,11 @@ BuildEvent（日志/状态事件，带单调序号 seq）
 
 ```text
 1. claim job（长轮询）
-2. prepare: 复用主机 CARGO_HOME；创建会话目录 /workspace/builds/<id>
-3. fetch source: git fetch（bare db 复用）→ worktree；或解压上传 tarball
+2. prepare: 复用主机 CARGO_HOME；按键选取 warm target 卷；创建会话目录
+3. fetch source: 共享 git 工作区 fetch + detached checkout（同 URL 加锁）；
+   或解压上传 tarball；按需自动安装系统包（slim → build-essential）
 4. configure env: RUSTC_WRAPPER=sccache, CARGO_INCREMENTAL=0,
-   独立 CARGO_TARGET_DIR，目标平台 rustflags（mold/lld）
+   键控 CARGO_TARGET_DIR，交叉编译 rustlib/cross 工具链
 5. run cargo build --build-plan? 逐行采集 stdout/stderr 事件（带 seq）
 6. collect artifacts: glob → 计算 blake3 → 上传 hotpot-store
 7. report timings（fetch/build/link/upload 分段）与最终状态
@@ -201,6 +209,7 @@ Fetch → Preflight(预热启动, /healthz:warm) → Arm(fd 交接/REUSEPORT)
 | M6 ✅ | `hotpot-dev`：热重载 + socket keeper | 改函数体 325ms 重建重启、构建失败保留旧进程、重启窗口 0 拒连；watcher 提前注册消除 FSEvents 注册空窗丢事件 |
 | M7 ✅ | docker 执行器（bollard）、docker-compose 发行、CI、文档完善 | docker_live 3 测试实测通过（成功/失败/取消，产物经挂载回宿主）；compose 端到端实测：healthz→提交构建→兄弟容器冷构建 3m13s 成功→产物下载（可执行位保留）→Linux 容器内实际运行 API 通过；GitHub Actions CI；README 开源发布 |
 | M8 ✅ | 协议层加固（缓存鉴权、`.sccache_check` 契约、turbo 元数据与签名回显、HTTP 层契约测试）；F13 工具链选择；F14 构建列表与 `running` 状态流转；F15 `/metrics`；F16 `/v1/toolchains`；F18 git 来源（默认关闭）；配置体系（TOML + 环境变量 + CLI 三级覆盖）；双协议文档与价值文档 | 协议契约测试 16 项（`.sccache_check` 404/204、Content-Length 严格一致、租户隔离、404 唯一 miss、签名回显与补齐）；工具链 `1.93`/`stable` 成功、`1.60` 明确失败且 `error` 带真实诊断；鉴权 401/404 实测；`/metrics` 与 `/v1/builds` 实测；`clippy -D warnings` 与全量测试通过 |
+| M9 ✅ | 真实开源项目构建 + 两级 warm 复用：slim 镜像 build-essential 自动供给、warm target 卷（键控 CARGO_TARGET_DIR + 20GiB LRU）、共享 git 工作区（部分克隆 + 按 URL 全周期锁）；交叉编译 rustlib 持久化 | fd 冷 113.5s→暖 4.3s（26.1x）、bat 38.7→7.6s（5.1x）、ripgrep 22.7→7.9s（2.9x）；cold/warm blake3 全一致、smoke 版本正确；交叉 aarch64→x86_64 315.9s→14.0s（22.6x）；多版本矩阵 1.85/1.93/1.98.0/stable 全绿 |
 
 ## 12. 部署形态演进
 

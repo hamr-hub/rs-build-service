@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         store: state.store.clone(),
         cache: state.cache.clone(),
         workers: state.workers,
+        gc_stats: state.gc_stats.clone(),
         executor: format!("{:?}", state.executor),
         toolchain: state.default_toolchain.clone(),
         version: env!("CARGO_PKG_VERSION"),

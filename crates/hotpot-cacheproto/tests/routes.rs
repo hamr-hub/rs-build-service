@@ -110,6 +110,37 @@ async fn sccache_put_is_idempotent_by_key() {
     assert_eq!(body.as_ref(), b"first");
 }
 
+/// 幂等命中时也必须**消费完请求体**。
+///
+/// 回归：曾经的实现对已存在的 key 直接返回 204 而不读 body，客户端在上传
+/// 途中收到响应就判定传输失败（curl 报错；turbo 更糟——它会在连接错误时
+/// 重试 PUT，于是每次重试都再触发一次提前应答，把一次幂等命中放大成持续的
+/// 失败流量）。用「一个大 body 打到已存在的 key」来复现：body 大到足以
+/// 撑满内部通道，早期返回会立刻暴露。
+#[tokio::test]
+async fn put_to_existing_key_still_drains_the_body() {
+    let (app, _dir) = app().await;
+    let uri = format!("/sccache/{KEY}");
+    call(&app, Method::PUT, &uri, b"first").await;
+
+    // 2 MiB：远大于 128 字节的压缩决策缓冲与 8 帧通道容量。
+    let big = vec![b'z'; 2 * 1024 * 1024];
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri(&uri)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(big))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // body 被完整读走：响应没有残留错误，且原有对象未被覆盖。
+    let get = call(&app, Method::GET, &uri, b"").await;
+    let body = axum::body::to_bytes(get.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"first");
+}
+
 /// sccache 启动能力探测契约：GET 必须 404（NotFound 被容忍），
 /// PUT 必须 2xx（否则 sccache **静默降级为只读**，远端写入全部丢弃）。
 /// 这条契约最容易被「顺手加个 key 格式校验」打破，所以显式钉住。

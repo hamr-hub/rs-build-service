@@ -29,8 +29,8 @@ futures = "0.3"
 
 # Web / RPC
 axum = { version = "0.8", features = ["macros"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "auth", "limit", "set-header"] }
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "auth", "limit", "set-header", "timeout", "compression-br", "compression-gzip", "fs", "normalize-path"] }
 hyper = "1"
 
 # Serialization
@@ -58,6 +58,7 @@ bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
+filetime = "0.2"
 walkdir = "2"
 zstd = "0.13"
 ignore = "0.4"

@@ -3,13 +3,15 @@
 //! 配置优先级：**内置默认值 < TOML 配置文件 < 环境变量 < 命令行参数**。
 //! 环境变量与命令行参数用 `HOTPOT_*` 前缀，命名与配置文件字段一一对应。
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use clap::Parser;
 use hotpot_api::driver::{SccacheConfig, WorkerConfig};
+use hotpot_api::hardening;
 use hotpot_api::{AppState, router};
 use hotpot_cacheproto::RemoteCache;
 use hotpot_core::config::ServerConfig;
@@ -48,6 +50,24 @@ struct Args {
     /// 单构建超时秒数。
     #[arg(long)]
     build_timeout_secs: Option<u64>,
+    /// 会话目录保留时长（秒）；成功构建超过即被回收。
+    #[arg(long)]
+    session_max_age_secs: Option<u64>,
+    /// 失败/超时构建的会话保留时长（秒）。
+    #[arg(long)]
+    session_failed_max_age_secs: Option<u64>,
+    /// 后台回收扫描间隔（秒）。
+    #[arg(long)]
+    gc_interval_secs: Option<u64>,
+    /// git 共享工作区最长保留时长（秒）。
+    #[arg(long)]
+    git_workspace_max_age_secs: Option<u64>,
+    /// 关闭 docker 执行器的系统包自动供给（气隙环境 / 预烘焙镜像）。
+    #[arg(long)]
+    docker_no_provision: bool,
+    /// CAS 容量上限（字节），0 为不限。
+    #[arg(long)]
+    cache_max_bytes: Option<u64>,
     /// 启用自身构建的 sccache 闭环加速（构建复用本服务的 /sccache 端点）。
     #[arg(long)]
     self_sccache: bool,
@@ -58,6 +78,26 @@ struct Args {
     /// **等价于在服务上执行不可信代码**，默认关闭）。
     #[arg(long)]
     allow_git_source: bool,
+    /// 允许跨源访问的来源，逗号分隔（如 https://console.internal）。
+    /// `*` 表示放行任意来源；留空（同源部署）不加 CORS 头。
+    #[arg(long, env = "HOTPOT_CORS_ORIGINS")]
+    cors_origins: Option<String>,
+    /// 单个非流式请求的服务端处理超时（秒）；SSE 日志流不受此限制。
+    #[arg(long, env = "HOTPOT_REQUEST_TIMEOUT_SECS")]
+    request_timeout_secs: Option<u64>,
+    /// 同时处理的普通请求数上限，超出直接返回 503（快失败而非无限排队）。
+    /// SSE 日志流不计入该配额。
+    #[arg(long, env = "HOTPOT_MAX_CONCURRENT_REQUESTS")]
+    max_concurrent_requests: Option<usize>,
+    /// 请求体上限（字节）。
+    #[arg(long, env = "HOTPOT_MAX_REQUEST_BODY")]
+    max_request_body: Option<usize>,
+    /// 关闭响应压缩。
+    #[arg(long)]
+    no_compression: bool,
+    /// 前端构建产物目录（web/dist）。存在时由本服务同源托管，实现单进程交付。
+    #[arg(long, env = "HOTPOT_WEB_DIR")]
+    web_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -87,7 +127,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
     let scheduler = Scheduler::open(&data_dir).await?;
-    let store = LocalStore::open(data_dir.join("store"), StoreOptions::default())?;
+    // 容量上限此前从未接线：`StoreOptions::default()` 是 0（不限），
+    // `config.cache.max_bytes` 是个死字段，CAS 会无限增长直到磁盘写满。
+    let store = LocalStore::open(
+        data_dir.join("store"),
+        StoreOptions {
+            max_bytes: config.cache.max_bytes,
+            compression: config.cache.compression,
+        },
+    )?;
     let remote_cache = RemoteCache::open(&data_dir, store.clone()).await?;
 
     // 构建默认走宿主工具链：把它写进 /metrics，用户一眼能看出「这台机器的
@@ -96,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let state = AppState::new(scheduler.clone(), store)
+    let state = AppState::new(scheduler.clone(), store.clone())
         .with_cache(remote_cache.clone())
         .with_executor(executor.clone())
         .with_git_source(allow_git_source);
@@ -176,7 +224,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         worker_config = worker_config.with_sccache(sccache);
     }
     worker_config.allow_git_source = allow_git_source;
+    worker_config.provision_system_packages = !args.docker_no_provision
+        && !matches!(
+            std::env::var("HOTPOT_DOCKER_NO_PROVISION").as_deref(),
+            Ok("1") | Ok("true")
+        );
 
+    tracing::info!(
+        workers,
+        provision_system_packages = worker_config.provision_system_packages,
+        "worker configuration resolved"
+    );
     for i in 0..workers {
         let worker_state = state.clone();
         let worker_config = worker_config.clone();
@@ -186,19 +244,188 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 后台回收：会话目录 + CAS 容量。启动时先跑一次——
+    // 服务崩溃后遗留的会话目录只有重启才能清掉。
+    {
+        use hotpot_api::gc::SessionPolicy;
+        let policy = SessionPolicy {
+            max_age: hotpot_core::config::secs_or(
+                config.session_max_age_secs,
+                SessionPolicy::default().max_age,
+            ),
+            failed_max_age: hotpot_core::config::secs_or(
+                config.session_failed_max_age_secs,
+                SessionPolicy::default().failed_max_age,
+            ),
+            keep_last: config.session_keep_last as usize,
+            interval: hotpot_core::config::secs_or(
+                config.gc_interval_secs,
+                SessionPolicy::default().interval,
+            ),
+        };
+        tracing::info!(
+            max_age_secs = policy.max_age.as_secs(),
+            failed_max_age_secs = policy.failed_max_age.as_secs(),
+            keep_last = policy.keep_last,
+            interval_secs = policy.interval.as_secs(),
+            cas_max_bytes = config.cache.max_bytes,
+            "resource janitor enabled"
+        );
+        spawn_janitor(
+            scheduler.clone(),
+            data_dir.clone(),
+            store.clone(),
+            state.gc_stats.clone(),
+            policy,
+            hotpot_core::config::secs_or(
+                config.git_workspace_max_age_secs,
+                std::time::Duration::from_secs(7 * 24 * 3600),
+            ),
+        );
+    }
+
     // 两个路由器各自的状态在 merge 前注入，合并为 Router<()>。
     let token = args.cache_token.map(Arc::<str>::from);
+
+    // ---- 生产加固层 ----
+    //
+    // 顺序有讲究：压缩最内层（只压已经生成好的响应），限流在压缩外层
+    // （限的是"正在占用资源"的数量，而不是响应体的字节数），超时再外层，
+    // CORS 最外层（要能在被拒的响应上也带上跨源头）。
+    let shedder = hardening::LoadShedder::new(args.max_concurrent_requests.unwrap_or(256));
+    let request_timeout = Duration::from_secs(args.request_timeout_secs.unwrap_or(30));
+    let body_limit = args.max_request_body.unwrap_or(256 * 1024);
+    let cors = hardening::CorsOrigins::parse(args.cors_origins.as_deref().unwrap_or(""));
+
+    tracing::info!(
+        max_concurrent = shedder.limit(),
+        request_timeout_secs = request_timeout.as_secs(),
+        max_request_body = body_limit,
+        compression = !args.no_compression,
+        cors = ?cors,
+        "production hardening enabled"
+    );
+
     let app = Router::new()
         .merge(router(state))
         .merge(
             hotpot_cacheproto::router(token)
                 .with_state(hotpot_cacheproto::CacheState::new(remote_cache)),
         )
-        .layer(TraceLayer::new_for_http());
+        // 同源托管前端产物：单进程交付，省掉一层反向代理与跨源配置。
+        .merge(hardening::frontend_router(
+            &args
+                .web_dir
+                .clone()
+                .unwrap_or_else(|| data_dir.join("web")),
+        ))
+        .layer(hardening::body_limit_layer(body_limit));
+
+    // 顺序有意义：限流在超时**外层**，这样排队等不到 permit 的请求由限流
+    // 直接拒绝，而不会先被超时打断成 503。
+    let mut app = hardening::load_shed_middleware(app, shedder.clone());
+    app = hardening::timeout_middleware(app, request_timeout);
+
+    if !args.no_compression {
+        app = app.layer(hardening::compression_layer());
+    }
+    if let Some(cors_layer) = cors.layer() {
+        app = app.layer(cors_layer);
+    }
+    let app = app.layer(TraceLayer::new_for_http());
+
     let listener = TcpListener::bind(&config.listen).await?;
     tracing::info!("hotpot-server listening on http://{}", config.listen);
-    axum::serve(listener, app).await?;
+    serve_with_graceful_shutdown(listener, app).await?;
     Ok(())
+}
+
+/// 带优雅停机与 TCP 调用的服务循环。
+///
+/// 优雅停机是可靠性的最后一环：直接 `axum::serve(..).await` 的话，收到
+/// SIGTERM 会**立刻**断掉所有在途请求和正在推日志的 SSE 长连接——用户看到
+/// 的是日志流莫名其妙中断，构建本身却毫发无损。正确做法是先停止接受新连接，
+/// 再等已有的（含 SSE）自行结束。
+///
+/// TCP 侧关掉 Nagle：控制面全是小响应（healthz、状态查询），Nagle 的延迟
+/// 叠加在这里纯属浪费。
+async fn serve_with_graceful_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown = async {
+        let ctrl_c = async {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!(error = %e, "failed to install Ctrl-C handler");
+                // 装不上就永远不触发，交给 SIGTERM 路径。
+                std::future::pending::<()>().await;
+            }
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to install SIGTERM handler");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("received SIGINT, draining"),
+            _ = terminate => tracing::info!("received SIGTERM, draining"),
+        }
+    };
+
+    // nodelay：延迟敏感的 SSE/日志流默认会被 Nagle 算法延迟 ~40ms，
+    // 由 tokio 在 listener 层面设置（axum 0.8 的 Serve 不再暴露该选项）。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
+    tracing::info!("hotpot-server stopped cleanly");
+    Ok(())
+}
+
+/// 后台回收循环：会话目录判龄删除 + CAS 容量兜底。
+///
+/// 首轮在启动时立即执行（清掉上次崩溃遗留的目录），之后按 interval 周期运行。
+/// 单轮出错只告警、不终止循环——回收器自己挂掉等于磁盘泄漏，必须能自愈。
+fn spawn_janitor(
+    scheduler: Scheduler,
+    data_root: PathBuf,
+    store: hotpot_store::LocalStore,
+    stats: Arc<hotpot_api::gc::GcStats>,
+    policy: hotpot_api::gc::SessionPolicy,
+    workspace_max_age: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(policy.interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match hotpot_api::gc::sweep_sessions(&scheduler, &data_root, &policy).await {
+                Ok(report) => stats.record_sweep(&report),
+                Err(e) => tracing::warn!("session sweep failed: {e}"),
+            }
+            let workspaces = data_root.join("git-workspaces");
+            match hotpot_api::gc::sweep_git_workspaces(&workspaces, workspace_max_age).await {
+                Ok((removed, freed)) => stats.record_workspace_sweep(removed, freed),
+                Err(e) => tracing::warn!("git workspace sweep failed: {e}"),
+            }
+            if let Err(e) = hotpot_api::gc::enforce_capacity(&store, &stats) {
+                tracing::warn!("CAS capacity enforcement failed: {e}");
+            }
+        }
+    });
 }
 
 /// 读 TOML 配置文件；不存在时报错（显式指定的文件不该被静默忽略）。
@@ -235,6 +462,21 @@ fn apply_env(config: &mut ServerConfig) {
     if let Ok(v) = std::env::var("HOTPOT_SCCACHE_WEBDAV_URL") {
         config.cache.sccache_webdav_url = Some(v);
     }
+    if let Ok(v) = std::env::var("HOTPOT_SESSION_MAX_AGE_SECS") {
+        if let Ok(n) = v.parse() {
+            config.session_max_age_secs = n;
+        }
+    }
+    if let Ok(v) = std::env::var("HOTPOT_SESSION_FAILED_MAX_AGE_SECS") {
+        if let Ok(n) = v.parse() {
+            config.session_failed_max_age_secs = n;
+        }
+    }
+    if let Ok(v) = std::env::var("HOTPOT_GC_INTERVAL_SECS") {
+        if let Ok(n) = v.parse() {
+            config.gc_interval_secs = n;
+        }
+    }
     if let Ok(v) = std::env::var("HOTPOT_SELF_SCCACHE") {
         config.cache.self_sccache = matches!(v.as_str(), "1" | "true" | "yes");
     }
@@ -253,6 +495,21 @@ fn apply_args(config: &mut ServerConfig, args: &Args) {
     }
     if let Some(v) = args.build_timeout_secs {
         config.build_timeout_secs = v;
+    }
+    if let Some(v) = args.session_max_age_secs {
+        config.session_max_age_secs = v;
+    }
+    if let Some(v) = args.session_failed_max_age_secs {
+        config.session_failed_max_age_secs = v;
+    }
+    if let Some(v) = args.gc_interval_secs {
+        config.gc_interval_secs = v;
+    }
+    if let Some(v) = args.git_workspace_max_age_secs {
+        config.git_workspace_max_age_secs = v;
+    }
+    if let Some(v) = args.cache_max_bytes {
+        config.cache.max_bytes = v;
     }
 }
 
