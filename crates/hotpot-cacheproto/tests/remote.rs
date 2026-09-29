@@ -14,7 +14,14 @@ async fn setup() -> (RemoteCache, tempfile::TempDir) {
 async fn put_get_by_key() {
     let (cache, _dir) = setup().await;
     cache
-        .put(Namespace::Sccache, "ab/cd", "", b"artifact bytes", None)
+        .put(
+            Namespace::Sccache,
+            "ab/cd",
+            "",
+            b"artifact bytes",
+            None,
+            Default::default(),
+        )
         .await
         .unwrap();
     let entry = cache
@@ -48,11 +55,25 @@ async fn missing_is_none() {
 async fn put_is_idempotent() {
     let (cache, _dir) = setup().await;
     let d1 = cache
-        .put(Namespace::Turbo, "h1", "", b"same", None)
+        .put(
+            Namespace::Turbo,
+            "h1",
+            "",
+            b"same",
+            None,
+            Default::default(),
+        )
         .await
         .unwrap();
     let d2 = cache
-        .put(Namespace::Turbo, "h1", "", b"same", None)
+        .put(
+            Namespace::Turbo,
+            "h1",
+            "",
+            b"same",
+            None,
+            Default::default(),
+        )
         .await
         .unwrap();
     assert_eq!(d1, d2);
@@ -62,7 +83,14 @@ async fn put_is_idempotent() {
 async fn tenants_are_isolated() {
     let (cache, _dir) = setup().await;
     cache
-        .put(Namespace::Turbo, "h1", "team-a", b"a data", None)
+        .put(
+            Namespace::Turbo,
+            "h1",
+            "team-a",
+            b"a data",
+            None,
+            Default::default(),
+        )
         .await
         .unwrap();
     assert!(
@@ -85,7 +113,14 @@ async fn tenants_are_isolated() {
 async fn tag_round_trips() {
     let (cache, _dir) = setup().await;
     cache
-        .put(Namespace::Turbo, "h1", "", b"x", Some("signed-tag".into()))
+        .put(
+            Namespace::Turbo,
+            "h1",
+            "",
+            b"x",
+            Some("signed-tag".into()),
+            Default::default(),
+        )
         .await
         .unwrap();
     let entry = cache

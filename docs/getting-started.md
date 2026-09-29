@@ -104,6 +104,22 @@ curl http://127.0.0.1:3000/health    # ok
 cargo run -p hotpot-cli -- cancel <build-id>
 ```
 
+## 5.1 接着可以试的
+
+```bash
+# 换工具链构建（未安装的工具链会明确失败，不静默回落）
+cargo run -p hotpot-cli -- build -p . --toolchain stable
+
+# 看这台机器上有什么工具链可用
+cargo run -p hotpot-cli -- toolchains
+
+# 列出构建
+cargo run -p hotpot-cli -- list
+
+# 观察服务状态：构建分布、队列、耗时、缓存命中率
+curl -s http://127.0.0.1:7878/metrics | grep hotpot_
+```
+
 ## 6. 数据目录结构
 
 `HOTPOT_DATA_DIR`（默认 `./hotpot-data`）下：
@@ -120,12 +136,14 @@ hotpot-data/
 
 ## 7. 继续探索
 
+- 💡 [**价值与意义**](why-hotpot.md) —— 解决谁的什么问题、为什么用 Rust 写、诚实的边界
 - 📖 [平台使用手册](guide/user-manual.md) —— CLI/API 完整参考、缓存接入、CI 集成、部署运维、故障排查
+- 🔌 [双协议缓存说明](protocols/README.md) —— [sccache WebDAV](protocols/sccache-webdav.md) / [Turborepo v8](protocols/turborepo-v8.md)
 - 🏛️ [系统架构文档](design/system-architecture.md) —— 运行时模型、持久化设计、并发控制、故障恢复
 - 🧩 [功能设计文档](design/feature-design.md) —— 各功能的规格、边界条件与异常处理
 - 📐 [总体架构设计（设计决策）](design/architecture.md)
 - 🔭 [项目愿景](VISION.md)
-- 📊 [基准基线](design/benchmark-baseline.md)
+- 📊 [基准基线与实测记录](design/benchmark-baseline.md)
 
 ## 8. 停止与卸载
 

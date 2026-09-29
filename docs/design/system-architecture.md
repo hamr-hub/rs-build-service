@@ -62,9 +62,9 @@ hotpot-core ◀──── hotpot-store
 | `hotpot-core` | serde, blake3/sha2, uuid, chrono, thiserror | lib：模型/摘要/ID/错误 |
 | `hotpot-store` | zstd, walkdir | lib：`BlobStore` trait + `LocalStore` |
 | `hotpot-scheduler` | sqlx (SQLite/WAL) | lib：`Scheduler` |
-| `hotpot-worker` | tokio, bollard | lib + bin：执行器 |
+| `hotpot-worker` | tokio, bollard | lib + bin：执行器（含 `toolchains` 盘点 / `tools` 预取） |
 | `hotpot-cacheproto` | axum, sqlx | lib：路由 + `RemoteCache` |
-| `hotpot-api` | axum, tower-http, reqwest(间接) | lib + bin `hotpot-server` |
+| `hotpot-api` | axum, tower-http, sqlx, toml | lib + bin `hotpot-server`（含 `metrics` / `toolchains` / `source` 模块） |
 | `hotpot-cli` | clap, reqwest (rustls) | bin `hotpot` |
 | `hotpot-agent` | libc, clap, serde | bin `hotpot-agent` + lib |
 | `hotpot-dev` | notify, clap, tokio | bin `hotpot-dev` + lib |
@@ -273,9 +273,11 @@ hotpot-server 容器 ──挂载── /var/run/docker.sock
    ▼
 daemon 在宿主上创建构建容器（rust:1.98-slim-bookworm）
    bind mounts（全部用宿主绝对路径）:
-     <project>        → /workspace
-     <session/target> → /target
-     <sccache dir>    → /sccache（如启用）
+     <project>            → /workspace
+     <session/target>     → /target
+     <session/sccache>    → /sccache      （启用编译缓存时）
+     <data>/tools/…/sccache → /opt/sccache/sccache（单文件，启用时）
+     <data>/tools/cargo-home → /cargo     （容器专用 CARGO_HOME）
 ```
 
 关键正确性条件：
@@ -285,6 +287,33 @@ daemon 在宿主上创建构建容器（rust:1.98-slim-bookworm）
    构建容器写回 target 的产物才能被服务进程读到；
 3. 容器内执行与本地执行共用 `cargo_invocation()` 生成 cargo 参数与环境变量，
    采集路径完全一致，两种后端行为对齐。
+
+### 8.1 sccache 供给（容器内没有 sccache）
+
+官方 `rust:*-slim` 镜像**不带 sccache**，因此启用编译缓存时要供给二进制：
+
+- 按 **daemon 架构**（不是宿主架构！）选资产，从官方 GitHub release 拉取
+  musl 静态二进制（可在 Debian glibc 镜像内直接运行）；
+- 以**单文件** bind mount 到 `/opt/sccache/sccache` 并显式作为
+  `RUSTC_WRAPPER` 路径——不依赖镜像 PATH，也不必挂整个目录；
+- **必须通过 SHA-256 校验才会被执行**：摘要取自 GitHub Release API 各 asset 的
+  `digest` 字段并在代码里固定（`tools::PINNED_SHA256`）。没有固定摘要的架构
+  一律拒绝下载——这个二进制会被当作 `RUSTC_WRAPPER` 注入**用户的构建**，
+  未校验的下载等于把供应链信任交给一次不透明的 HTTP 响应；
+- 解包用系统 `tar`（不引入 tar/flate2 依赖：Hotpot 的运行前提本就包含
+  docker 与 curl，为一次引导下载增加传递依赖不划算）；
+- 失败时**回退到镜像 PATH 中的 sccache**（若镜像自带），并把失败原因写进构建事件；
+- 容器内 `SCCACHE_DIR` 按构建隔离（sccache 本地盘同时存 server 状态与对象，
+  多容器并发共享易互相干扰）；
+- 容器专用 `CARGO_HOME` 跨构建共享 registry/git 缓存。
+  **绝不能复用宿主 `CARGO_HOME`**——它的 toolchain/registry 是宿主平台的。
+
+### 8.2 工具链与镜像的一致性
+
+`profile.toolchain` 指定时，把官方 `rust:` 镜像的版本段换成目标工具链
+（`rust:1.98-slim-bookworm` + `1.99.0` → `rust:1.99.0-slim-bookworm`），
+保证宿主与容器工具链一致。镜像不是官方 `rust:` 时**显式失败**并提示
+`--docker-image`，而不是静默用错工具链——工具链错配会让产物与缓存都不可移植。
 
 容器生命周期：连接 daemon（30s 超时）→ 确保镜像（自动 pull）→ create/attach →
 执行 → kill/等待回收（10s）→ remove。
@@ -310,19 +339,29 @@ daemon 在宿主上创建构建容器（rust:1.98-slim-bookworm）
 
 ## 10. 安全边界
 
-当前（M0–M7）：
+当前（M0–M8）：
 
 - **local 执行器**：构建以服务进程相同权限直接执行 cargo。build.rs/proc-macro 可执行任意代码，
   仅适合可信内网与可信源码；
 - **docker 执行器**：构建在工具链容器内，与服务环境隔离，但共享 daemon socket
   （daemon 等价宿主 root，服务容器因此不适合暴露给不可信用户）；
-- **输入校验**：边界检查路径存在性与 Cargo.toml；仅接受 local 来源；
-- **API 无鉴权**：PAT/OIDC 在设计中预留，部署时请置于内网或加反向代理鉴权；
-- **缓存隔离**：turbo 按 teamId/slug 做租户 key 隔离；sccache 按 key 路径；
-  缓存仅经控制面写。
+- **git 来源默认关闭**（M8）：`--allow-git-source` 才能开启。它会 clone 任意 URL
+  并执行其中的 `build.rs`/proc-macro，**等价于允许在服务进程权限下执行任意代码**。
+  API 边界与 worker 侧各校验一次（防止绕过 API 直接入队），开启时服务端显式告警；
+- **输入校验**：边界检查路径存在性与 Cargo.toml；工具链写法、target 三元组形状、
+  features/flags 条数与长度、git url/ref/sha 形状，全部 fail fast；
+- **构建 API 无鉴权**：PAT/OIDC 在设计中预留，部署时请置于内网或加反向代理鉴权；
+- **缓存端点可选 Bearer 鉴权**（M8）：`HOTPOT_CACHE_TOKEN`，常量时间比较。
+  默认关闭是为单机零配置自托管；但**一旦监听非回环地址，缓存 `PUT` 就是构建
+  供应链投毒面**（任何人可写入伪造产物，之后所有机器都会命中）。
+  服务在非回环监听且未设 token 时打印显式告警（`0.0.0.0` / `::` 按暴露处理）；
+- **缓存隔离**：turbo 按 teamId/slug 做租户 key 隔离（两者是独立命名空间）；
+  sccache 按 key 路径；缓存仅经控制面写；
+- **请求体上限**：缓存端点 `DefaultBodyLimit` 4 GiB，超限 `413`——
+  否则单个 PUT 就能吃满内存。
 
 红线（沿用总体设计）：key 必须覆盖输入闭包；会话 target 绝不跨项目共享；
-签名密钥不出控制面。
+签名密钥不出控制面（turbo 的 `x-artifact-tag` 服务端只存与回显，从不计算）。
 
 ## 11. 可观测性
 
@@ -330,10 +369,29 @@ daemon 在宿主上创建构建容器（rust:1.98-slim-bookworm）
 
 - `tracing` + `tracing-subscriber`（EnvFilter/RUST_LOG）；HTTP 层挂 `TraceLayer`；
 - 构建关键节点结构化日志（worker、build id short、mode、status、artifact 数）；
-- 事件表本身构成持久化构建日志（SSE 可任意回放）。
+- 事件表本身构成持久化构建日志（SSE 可任意回放）；
+- **`GET /metrics`（M8 接线）**：Prometheus 文本格式。构建侧指标一律从 SQLite
+  **现算**而非进程内累计，因此重启不会让 counter 回退（符合 Prometheus 语义）；
+  缓存命中/未命中是 `RemoteCache` 内的 `AtomicU64`，以「自进程启动以来」暴露。
+  覆盖：状态分布、队列深度与最老等待、五段耗时 sum/count/avg、
+  按协议的 hits/misses/puts/命中率、索引条目与字节、CAS 磁盘占用、worker 数、
+  `hotpot_info`（含默认工具链）。label 值做 Prometheus 转义。
 
 设计预留（未接线）：OTel trace/span（workspace 已含 opentelemetry 依赖）、
-命中率与队列延迟指标、in-toto provenance。
+in-toto provenance。
+
+### 11.1 失败可见性约定
+
+构建服务里最贵的 bug 是**静默降级**。Hotpot 的三条硬约定：
+
+1. **协议探测失败必须显式**。sccache 的 `.sccache_check` PUT 若非 2xx，
+   sccache 会静默变只读；Hotpot 显式短路该哨兵并用测试钉住契约。
+2. **加速是可选项，不是正确性依赖**。sccache 预取失败、远端端点不可达
+   一律降级为「不带编译缓存」并告警，绝不让构建失败。
+   远端端点在 worker 启动时主动探测——否则「远端没生效」只有一行
+   sccache 的 warning，用户几乎不可能发现。
+3. **失败原因要能直接读到**。构建失败时把最近 12 行 stderr 写进 `error` 字段，
+   而不是笼统的 `cargo build failed`；工具链未安装这类问题因此一眼可见。
 
 ## 12. 部署形态演进
 

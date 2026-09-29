@@ -4,5 +4,8 @@
 pub mod docker;
 pub mod executor;
 pub mod local;
+pub mod toolchains;
+pub mod tools;
 
 pub use executor::{BuildEvent, BuildPlan, BuildResult, EndReason, ExecutorKind, run_build};
+pub use toolchains::InstalledToolchain;

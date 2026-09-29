@@ -200,6 +200,7 @@ Fetch → Preflight(预热启动, /healthz:warm) → Arm(fd 交接/REUSEPORT)
 | M5 ✅ | `hotpot-agent`：fd 交接 supervisor + 部署状态机/回滚 | 压测下 0 丢连接（v1/v2 均接流），rollback 可用；修复初始版本双 spawn 幽灵进程缺陷 |
 | M6 ✅ | `hotpot-dev`：热重载 + socket keeper | 改函数体 325ms 重建重启、构建失败保留旧进程、重启窗口 0 拒连；watcher 提前注册消除 FSEvents 注册空窗丢事件 |
 | M7 ✅ | docker 执行器（bollard）、docker-compose 发行、CI、文档完善 | docker_live 3 测试实测通过（成功/失败/取消，产物经挂载回宿主）；compose 端到端实测：healthz→提交构建→兄弟容器冷构建 3m13s 成功→产物下载（可执行位保留）→Linux 容器内实际运行 API 通过；GitHub Actions CI；README 开源发布 |
+| M8 ✅ | 协议层加固（缓存鉴权、`.sccache_check` 契约、turbo 元数据与签名回显、HTTP 层契约测试）；F13 工具链选择；F14 构建列表与 `running` 状态流转；F15 `/metrics`；F16 `/v1/toolchains`；F18 git 来源（默认关闭）；配置体系（TOML + 环境变量 + CLI 三级覆盖）；双协议文档与价值文档 | 协议契约测试 16 项（`.sccache_check` 404/204、Content-Length 严格一致、租户隔离、404 唯一 miss、签名回显与补齐）；工具链 `1.93`/`stable` 成功、`1.60` 明确失败且 `error` 带真实诊断；鉴权 401/404 实测；`/metrics` 与 `/v1/builds` 实测；`clippy -D warnings` 与全量测试通过 |
 
 ## 12. 部署形态演进
 

@@ -9,6 +9,15 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 use tracing::debug;
 
+/// 终态构建的阶段耗时累计（`/metrics` 暴露 sum/count 后由调用方算均值）。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PhaseTotals {
+    pub queue_sum: u64,
+    pub build_sum: u64,
+    pub total_sum: u64,
+    pub count: u64,
+}
+
 /// 构建队列（一个 SQLite 连接池）。
 #[derive(Clone)]
 pub struct Scheduler {
@@ -99,6 +108,20 @@ impl Scheduler {
         }
     }
 
+    /// 标记构建进入运行态（执行器真正开始编译时调用）。
+    pub async fn mark_running(&self, id: BuildId) -> Result<()> {
+        sqlx::query(
+            "UPDATE builds SET status = '\"running\"', started_at_ms = ?1 \
+             WHERE id = ?2 AND status != '\"running\"'",
+        )
+        .bind(now_ms())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
+    }
+
     /// 续租（长构建期间定期调用）。
     pub async fn renew_lease(&self, id: BuildId, worker: &str, lease: Duration) -> Result<()> {
         let until = now_ms() + lease.as_millis() as i64;
@@ -176,6 +199,91 @@ impl Scheduler {
                 })
             })
             .collect()
+    }
+
+    /// 按状态倒序列出构建（支持状态过滤与分页）。
+    ///
+    /// `status` 用领域枚举的 JSON 形式（`"succeeded"`）存储，故此处比较时带引号。
+    pub async fn list_builds(
+        &self,
+        status: Option<BuildStatus>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<BuildRecord>> {
+        let limit = limit.clamp(1, 200);
+        let status_json = status
+            .map(|s| serde_json::to_string(&s))
+            .transpose()
+            .map_err(serde_err)?;
+        let rows = sqlx::query(
+            "SELECT * FROM builds \
+             WHERE (?1 IS NULL OR status = ?1) \
+             ORDER BY created_at_ms DESC, id DESC LIMIT ?2 OFFSET ?3",
+        )
+        .bind(status_json)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sqlx_err)?;
+        rows.into_iter().map(row_to_build).collect()
+    }
+
+    /// 各状态构建数（`/metrics` 用）。
+    pub async fn status_counts(&self) -> Result<Vec<(BuildStatus, u64)>> {
+        let rows = sqlx::query("SELECT status, COUNT(*) AS n FROM builds GROUP BY status")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+        rows.into_iter()
+            .map(|row| {
+                let status_json: String = rg(&row, "status")?;
+                let status: BuildStatus = serde_json::from_str(&status_json)
+                    .map_err(|e| Error::Other(format!("bad status in db: {e}")))?;
+                let n: i64 = rg(&row, "n")?;
+                Ok((status, n.max(0) as u64))
+            })
+            .collect()
+    }
+
+    /// 排队深度与最老排队任务的等待时长（毫秒；无排队任务时为 0）。
+    pub async fn queue_stats(&self) -> Result<(u64, u64)> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n, COALESCE(MIN(created_at_ms), 0) AS oldest \
+             FROM builds WHERE status = '\"queued\"'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(sqlx_err)?;
+        let n: i64 = rg(&row, "n")?;
+        let oldest: i64 = rg(&row, "oldest")?;
+        let waited = if oldest > 0 {
+            (now_ms() - oldest).max(0) as u64
+        } else {
+            0
+        };
+        Ok((n.max(0) as u64, waited))
+    }
+
+    /// 终态构建的阶段耗时累计（`/metrics` 用）：`(queue, build, total)` 的
+    /// `(sum, count)`。只统计已写入 timings 的终态记录。
+    pub async fn phase_duration_totals(&self) -> Result<PhaseTotals> {
+        let rows = sqlx::query("SELECT timings_json FROM builds WHERE timings_json != '{}'")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+        let mut totals = PhaseTotals::default();
+        for row in rows {
+            let json: String = rg(&row, "timings_json")?;
+            let Ok(t) = serde_json::from_str::<hotpot_core::BuildTimings>(&json) else {
+                continue;
+            };
+            totals.queue_sum += t.queue_ms;
+            totals.build_sum += t.build_ms;
+            totals.total_sum += t.total_ms;
+            totals.count += 1;
+        }
+        Ok(totals)
     }
 
     /// 获取构建记录。

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use hotpot_core::model::BuildProfile;
+use hotpot_core::toolchain::ToolchainRequest;
 use hotpot_core::{BuildId, BuildTimings};
 use tokio::sync::mpsc;
 
@@ -28,6 +29,17 @@ pub struct BuildPlan {
     pub sccache_dir: Option<PathBuf>,
     /// sccache 可执行文件路径：本地模式为宿主机路径，容器模式为镜像内命令名。
     pub sccache_bin: Option<PathBuf>,
+    /// Docker 模式：跨构建共享的容器 CARGO_HOME（registry/git 缓存）。
+    /// 必须是**容器平台专用**目录，不能指向宿主 CARGO_HOME。
+    pub cargo_home: Option<PathBuf>,
+    /// Docker 模式：预取工具目录（宿主下载好的 Linux sccache 等），挂载到容器 PATH 首位。
+    pub tools_dir: Option<PathBuf>,
+    /// 透传到构建进程/容器的额外环境变量（如 SCCACHE_WEBDAV_ENDPOINT）。
+    pub extra_env: Vec<(String, String)>,
+    /// 执行器事件的起始 seq（fetch 等前置阶段可能已占用编号）。
+    /// 事件 seq 起始值。源码获取阶段（git clone 等）已占用若干 seq，
+    /// 执行器从这里续接，保证单构建内 seq 全局单调。
+    pub first_seq: u64,
     /// 取消信号：值变为 true 时杀掉 cargo 并提前结束。
     pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
 }
@@ -93,6 +105,10 @@ impl BuildPlan {
             timeout: Duration::from_secs(1800),
             sccache_dir: None,
             sccache_bin: None,
+            cargo_home: None,
+            tools_dir: None,
+            extra_env: Vec::new(),
+            first_seq: 0,
             cancel: None,
         }
     }
@@ -106,11 +122,16 @@ impl BuildPlan {
 /// 由计划生成 cargo 参数与环境变量；本地与容器后端共用，保证行为一致。
 /// sccache 场景下 `rustc_wrapper` 为对应的 wrapper 命令（宿主路径或容器内命令名）。
 pub(crate) fn cargo_invocation(
+    toolchain: Option<&ToolchainRequest>,
     profile: &BuildProfile,
     sccache_dir: Option<&std::path::Path>,
     sccache_bin: Option<&std::path::Path>,
 ) -> (Vec<String>, Vec<(String, String)>) {
-    let mut args = vec!["build".to_string()];
+    let mut args = Vec::new();
+    if let Some(tc) = toolchain {
+        args.push(tc.cargo_plus_arg());
+    }
+    args.push("build".to_string());
     match profile.mode {
         hotpot_core::model::BuildMode::Release => args.push("--release".to_string()),
         hotpot_core::model::BuildMode::Debug => {}

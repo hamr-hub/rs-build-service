@@ -42,6 +42,12 @@ pub struct CacheConfig {
     /// 远程对象存储 endpoint（S3 兼容），None 时仅本地。
     pub remote_endpoint: Option<String>,
     pub remote_bucket: Option<String>,
+    /// 自身构建是否通过 sccache WebDAV 协议复用 crate 级缓存（闭环加速）。
+    pub self_sccache: bool,
+    /// sccache 远端缓存地址（含 `/sccache` 前缀）。None 时按监听地址推导。
+    pub sccache_webdav_url: Option<String>,
+    /// sccache 本地目录（宿主）；None 时用 `<data_dir>/sccache`。
+    pub sccache_dir: Option<PathBuf>,
 }
 
 impl Default for CacheConfig {
@@ -51,6 +57,33 @@ impl Default for CacheConfig {
             compression: true,
             remote_endpoint: None,
             remote_bucket: None,
+            self_sccache: false,
+            sccache_webdav_url: None,
+            sccache_dir: None,
         }
+    }
+}
+
+impl ServerConfig {
+    /// 自身构建使用的 sccache 远端地址：显式配置优先，否则由监听地址推导。
+    ///
+    /// 推导规则：`http://<listen>/sccache`。仅监听 `127.0.0.1` 时，
+    /// docker 执行器内的构建容器通常**无法**访问该地址，需显式配置
+    /// （如 `http://host.docker.internal:7878/sccache`）。
+    pub fn sccache_webdav_url(&self) -> String {
+        self.cache
+            .sccache_webdav_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{}/sccache", self.listen))
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    /// sccache 本地目录。
+    pub fn sccache_dir(&self) -> PathBuf {
+        self.cache
+            .sccache_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("sccache"))
     }
 }

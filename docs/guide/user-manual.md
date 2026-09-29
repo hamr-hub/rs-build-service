@@ -99,6 +99,13 @@ cargo run -p hotpot-api --bin hotpot-server
 | `--executor` | `local` | 构建执行后端：`local` / `docker`（也可用 `HOTPOT_EXECUTOR`） |
 | `--docker-image` | `rust:slim-bookworm` | docker 后端工具链镜像（也可用 `HOTPOT_DOCKER_IMAGE`） |
 | `--docker-host` | 自动探测 | docker daemon 地址，如 `unix:///var/run/docker.sock`（也可用 `HOTPOT_DOCKER_HOST`） |
+| `--config <PATH>` | 无 | TOML 配置文件（见 §11.3） |
+| `--build-timeout-secs` | `1800` | 单构建超时 |
+| `--self-sccache` | 关 | 让**自身构建**通过本服务的 `/sccache` 端点复用远端 crate 缓存 |
+| `--cache-token <T>` | 无（env `HOTPOT_CACHE_TOKEN`） | 缓存端点 Bearer token；**对外暴露时必须设置** |
+| `--allow-git-source` | 关 | 允许 git 来源构建（会执行不可信代码，见 §13） |
+
+配置优先级：**内置默认值 < TOML 配置文件 < 环境变量 < 命令行参数**。
 
 ## 3. CLI 完整参考
 
@@ -118,15 +125,28 @@ cargo install --path crates/hotpot-cli
 ### 3.1 `hotpot build` —— 提交构建并跟踪日志
 
 ```bash
-hotpot build -p ./my-app [--release] [--features a,b] [--no-follow]
+hotpot build -p ./my-app [--release] [--features a,b] [--toolchain 1.98.0] [--no-follow]
+hotpot build --git-url https://github.com/u/r.git --git-ref main
 ```
 
 | 参数 | 说明 |
 |------|------|
-| `-p, --project <PATH>` | Cargo 项目根目录（必填）；CLI 自动 canonicalize 为绝对路径提交 |
+| `-p, --project <PATH>` | Cargo 项目根目录（与 `--git-url` 二选一）；CLI 自动 canonicalize 为绝对路径提交 |
 | `--release` | release 模式（默认 debug） |
 | `--features <LIST>` | 启用的 features，逗号分隔 |
+| `--no-default-features` | 关闭默认 features |
+| `--target <TRIPLE>` | 目标三元组，如 `aarch64-unknown-linux-gnu` |
+| `--toolchain <SPEC>` | Rust 工具链：`stable` / `beta` / `nightly` / `nightly-2026-01-15` / `1.98` / `1.98.0` |
+| `--cargo-flag <ARG>` | 追加原生 cargo 参数（可重复，如 `--cargo-flag --offline`） |
+| `--git-url <URL>` | git 仓库地址（需服务端 `--allow-git-source`） |
+| `--git-ref <REF>` | git 引用，默认 `HEAD` |
+| `--git-sha <SHA>` | 锁定到具体 commit |
 | `--no-follow` | 只提交不跟踪日志 |
+
+> 工具链写法在**服务端边界**校验：非法工具链、畸形 target 三元组、
+> 超长/过多的 features 列表都会直接返回 `400`，不会占用队列与 worker。
+> docker 后端下，指定工具链会自动把官方 `rust:` 镜像的版本段换成目标版本，
+> 保证「宿主工具链」与「容器工具链」一致。
 
 行为：
 
@@ -185,6 +205,24 @@ hotpot download <build-id> [-o DIR]
 - `-o, --out <DIR>`：输出目录，默认 `./hotpot-out`；
 - Unix 下若产物带 `executable` 属性，下载后自动恢复可执行位（`| 0111`）。
 
+### 3.7 `hotpot list` —— 列出构建
+
+```bash
+hotpot list [--status succeeded] [--limit 20] [--offset 0]
+```
+
+按创建时间倒序输出 `BUILD / STATUS / BUILD_MS / TOTAL_MS / SOURCE`。
+
+### 3.8 `hotpot toolchains` —— 查看可用工具链
+
+```bash
+hotpot toolchains
+```
+
+输出宿主默认 `rustc` 版本、已安装的 rustup 工具链、docker daemon 已缓存的
+官方 `rust:` 镜像与 daemon 架构。盘点失败是**软失败**（只给 warning），
+不会让整个命令失败——发现接口不可用不该阻断排查。
+
 ## 4. HTTP API 完整参考
 
 - Base URL：默认 `http://127.0.0.1:7878`
@@ -197,16 +235,21 @@ hotpot download <build-id> [-o DIR]
 |--------|------|------|
 | GET | `/healthz` | 健康检查，返回 `ok` |
 | POST | `/v1/builds` | 提交构建 |
+| GET | `/v1/builds` | 列出构建（`status` / `limit` / `offset`） |
 | GET | `/v1/builds/{id}` | 查询构建 |
-| GET | `/v1/builds/{id}/logs/stream` | SSE 日志流 |
+| GET | `/v1/builds/{id}/logs/stream` | SSE 日志流（`?since=`） |
 | POST | `/v1/builds/{id}/cancel` | 取消构建 |
 | GET | `/v1/builds/{id}/artifacts` | 产物清单 |
-| GET | `/v1/artifacts/{digest}` | 下载产物 |
-| ANY | `/sccache/{key}` | sccache WebDAV 兼容端点 |
-| GET/HEAD/PUT | `/v8/artifacts/{hash}` | Turborepo v8 兼容端点 |
+| GET | `/v1/artifacts/{digest}` | 下载产物（`?filename=`） |
+| GET | `/v1/toolchains` | 工具链发现（宿主 rustup + docker 镜像） |
+| GET | `/metrics` | Prometheus 文本格式指标 |
+| ANY | `/sccache/{key}` | sccache WebDAV 兼容端点（可选 Bearer 鉴权） |
+| GET/HEAD/PUT/OPTIONS | `/v8/artifacts/{hash}` | Turborepo v8 兼容端点（可选 Bearer 鉴权） |
 | GET | `/v8/artifacts/status` | Turbo 缓存状态 |
 
-> `GET /v1/builds`（构建列表）当前返回 `405 Method Not Allowed`。
+> 缓存端点（`/sccache`、`/v8`）在设置 `HOTPOT_CACHE_TOKEN` 后要求
+> `Authorization: Bearer <token>`，不匹配返回 `401`。
+> 构建 API 本身仍无鉴权。
 
 ### 4.2 POST /v1/builds —— 提交构建
 
@@ -338,25 +381,57 @@ Hotpot 暴露与 sccache/opendal WebDAV 兼容的端点，载荷对服务端不�
 
 ```bash
 export SCCACHE_DIR="$HOME/.cache/sccache"
-# sccache 通过 WebDAV 接入（endpoint 指向 /sccache/，末尾路径段即 key 前缀）
-export CARGO_HOME_WEBDAV="http://127.0.0.1:7878/sccache/"
+# sccache 通过 WebDAV 接入。权威变量名是 SCCACHE_WEBDAV_ENDPOINT。
+export SCCACHE_WEBDAV_ENDPOINT="http://127.0.0.1:7878/sccache"
+# 等价写法（统一 URL 形式，带 webdav+ scheme）：
+# export SCCACHE_REMOTE_STORAGE="webdav+http://127.0.0.1:7878/sccache"
 
 RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 cargo build
 ```
 
-> 不同 sccache 版本 WebDAV 配置项名称略有差异；也可使用 opendal 配置
-> `webdav` scheme，endpoint 填 `http://<host>:7878/sccache`。
+> ### ⚠️ 不存在的变量名
+>
+> `CARGO_HOME_WEBDAV`、`SCCACHE_WEBDAV_URL`、`SCCACHE_WEBDAV_PREFIX`
+> **都不是 sccache 的变量**。配错的后果是 sccache **完全不报错**，
+> 只是安静地退回本地盘缓存——表现为「远端没生效」且没有任何提示。
+>
+> 另外 `SCCACHE_WEBDAV_KEY_PREFIX` 是**独立变量**（默认空），
+> 不是从 endpoint 尾部解析出来的。
+>
+> **排查第一步永远是 `sccache --show-stats`**：看有没有远端相关的
+> hits/misses 计数。
+
+**建议同时设置**：
+
+```bash
+# 减少写前探测请求（Hotpot 两种模式都支持）
+export SCCACHE_WEBDAV_DISABLE_CREATE_DIR=true
+# 跨机共享时剥离路径前缀，避免绝对路径击穿命中率
+export SCCACHE_BASEDIRS="/home/ci/workspace"
+```
+
+**服务启用了 `HOTPOT_CACHE_TOKEN` 时**，sccache 需携带同一个 token：
+
+```bash
+export SCCACHE_WEBDAV_TOKEN="$HOTPOT_CACHE_TOKEN"
+```
+
+完整协议说明（URL 三层分片、写前探测序列、`.sccache_check` 契约、
+排障速查）见 [sccache WebDAV 协议文档](../protocols/sccache-webdav.md)。
 
 ### 6.2 HTTP 语义
 
 | 方法 | 行为 |
 |------|------|
-| GET | 命中返回 200 + `application/octet-stream`；未命中 404 |
-| HEAD | 命中 200；未命中 404 |
-| PUT | 写入，返回 `204 No Content`；同 key 重复写为幂等 no-op |
+| GET | 命中返回 200 + `application/octet-stream`（`Content-Length` 与 body 严格一致）；未命中 404 |
+| HEAD | 命中 200；未命中 404（真实 sccache 读路径不发 HEAD，保留供排查） |
+| PUT | 写入，返回 `204 No Content`；同 key 重复写为幂等 no-op（**不覆盖** body） |
 | MKCOL | 一律 `201 Created`（集合是虚拟的，不落盘） |
-| PROPFIND | 返回 `207 Multi-Status`，含 `resourcetype` / `getlastmodified` / `getcontentlength` |
+| PROPFIND | 返回 `207 Multi-Status`，含 `resourcetype` / `getlastmodified` / `getcontentlength`；`href` 做 XML 转义 |
 | OPTIONS | 200 |
+| `.sccache_check` | `GET`→404、`PUT`→204，且**不落盘**（sccache 启动能力探测契约） |
+| 其它 | 405 |
+| 体积超限（>4 GiB） | 413 |
 
 实测基线（demo-webapp，89 个 crate）：冷构建 11.8s、写穿 68.7 MB；
 全新 `SCCACHE_DIR` 纯远端命中 100%，4.2s。
@@ -366,20 +441,27 @@ RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 cargo build
 兼容 Vercel Turborepo v8 协议（以真实 `turbo` 客户端验证）。
 
 ```bash
-# turbo 通过环境变量接入自定义缓存端点
-TURBO_API=http://127.0.0.1:7878 \
-TURBO_TEAM=team_demo \
-TURBO_TOKEN=anything \
-turbo run build --cache=remote:rw
+# 通过环境变量接入自定义缓存端点
+export TURBO_API=http://127.0.0.1:7878     # 不要带结尾斜杠（会变成 //v8/…）
+export TURBO_TEAM=my-team                  # → ?slug=
+export TURBO_TEAMID=team_myteam            # → ?teamId=（**必须** team_ 前缀）
+export TURBO_TOKEN="$HOTPOT_CACHE_TOKEN"    # 服务端启用鉴权时才需要
+
+turbo run build --cache=local:rw,remote:rw
 ```
 
 - `GET /v8/artifacts/status` → `{"status":"enabled"}`；
-- 租户：查询参数 `teamId` 或 `slug`（二选一，均无则为默认空租户），租户间互不可见；
-- GET 命中时原样回传上传时的 `x-artifact-tag` 响应头；PUT 支持携带该头并持久化；
-- PUT 成功返回 `201 Created`；
-- `TURBO_TOKEN` 当前不校验（预留鉴权）。
+- 租户：查询参数 `teamId` 或 `slug`，租户间互不可见（两者是**独立**命名空间）；
+  `teamId` 不以 `team_` 开头会被 turbo 客户端**静默丢弃**；
+- GET 命中时原样回传 `x-artifact-tag`（签名工件**必须**回显，否则客户端硬错误），
+  以及 `x-artifact-duration` / `-sha` / `-dirty-hash`；
+- PUT 成功返回 `201 Created`；**404 是唯一的 miss 信号**，其它非 2xx 会让 turbo 报错；
+- `OPTIONS` 预检已支持（`--preflight` 场景）。
 
-实测：清空本地缓存后 `--cache=remote:rw` → `FULL TURBO`（32ms）。
+实测：清空本地缓存后 `--cache=local:,remote:rw` → `FULL TURBO`（32ms）。
+
+完整协议说明（端点表、签名与内容完整性、curl 实操、已知边界）见
+[Turborepo v8 协议文档](../protocols/turborepo-v8.md)。
 
 ## 8. CI 集成
 
@@ -527,7 +609,49 @@ SIGTERM 后停止 accept、排空在飞请求再退出。`hotpot-agent` crate �
 | `HOTPOT_PROJECT_ROOT` | compose | 当前目录 | 挂载并允许构建的项目根 |
 | `HOTPOT_DATA_DIR` | compose | `$PWD/hotpot-data` | 数据目录 |
 | `HOTPOT_CARGO_BIN` | worker/dev | `cargo` | 覆盖 cargo 可执行文件（测试/定制用） |
+| `HOTPOT_LISTEN` | server | `127.0.0.1:7878` | 覆盖监听地址 |
+| `HOTPOT_DATA_DIR` | server | `./hotpot-data` | 覆盖数据目录 |
+| `HOTPOT_WORKERS` | server | `0` | 覆盖内嵌 worker 数 |
+| `HOTPOT_BUILD_TIMEOUT_SECS` | server | `1800` | 覆盖单构建超时 |
+| `HOTPOT_SELF_SCCACHE` | server | `false` | 等价于 `--self-sccache` |
+| `HOTPOT_SCCACHE_WEBDAV_URL` | server | 无 | 自身构建的 sccache 端点（docker 后端**必须**显式设置） |
+| `HOTPOT_CACHE_TOKEN` | server | 无 | 缓存端点 Bearer token（对外暴露时必设） |
+| `HOTPOT_ALLOW_GIT_SOURCE` | server | `false` | 等价于 `--allow-git-source` |
 | `RUST_LOG` | 全部服务端 | `info` | tracing 过滤指令，如 `debug,hotpot_worker=info` |
+
+### 11.1.1 缓存鉴权
+
+```bash
+export HOTPOT_CACHE_TOKEN=$(openssl rand -hex 32)
+```
+
+- sccache 侧：`export SCCACHE_WEBDAV_TOKEN="$HOTPOT_CACHE_TOKEN"`
+- turbo 侧：`export TURBO_TOKEN="$HOTPOT_CACHE_TOKEN"`
+
+> 缓存端点默认不鉴权是为单机零配置自托管。**一旦监听非回环地址，
+> `PUT` 就是构建供应链投毒面**（任何人都能写入伪造产物，之后所有机器都会命中）。
+> 服务在非回环监听且未设 token 时会打印显式告警。
+
+### 11.3 配置文件（TOML）
+
+```toml
+# hotpot.toml
+listen = "0.0.0.0:7878"
+data_dir = "/var/lib/hotpot"
+workers = 4
+build_timeout_secs = 1800
+
+[cache]
+max_bytes = 10737418240      # 本地 CAS 容量上限，0 = 不限
+compression = true
+self_sccache = true          # 自身构建复用本服务 /sccache 端点
+sccache_webdav_url = "http://hotpot.internal:7878/sccache"   # docker 后端需显式设置
+sccache_dir = "/var/lib/hotpot/sccache"
+```
+
+```bash
+hotpot-server --config hotpot.toml
+```
 
 ### 11.2 端口
 
@@ -563,15 +687,40 @@ SIGTERM 后停止 accept、排空在飞请求再退出。`hotpot-agent` crate �
 **Q：agent 提示 `no previous release to roll back to`？**
 还没有任何一次成功完成的部署，因此没有 previous。先成功 deploy 一次。
 
+**Q：docker 构建日志出现 `sha256 mismatch for … sccache`？**
+内置 sccache 预取的下载物未通过固定摘要校验，文件已被删除且**不会执行**。
+这通常意味着上游 release 被重新打包（摘要变化）或下载被中间人篡改。
+请核对 `crates/hotpot-worker/src/tools.rs` 中 `PINNED_SHA256` 与官方 release
+的 `digest`，确认后再更新常量；在此之前 docker 构建会自动回退到「不带编译缓存」。
+
+**Q：`--self-sccache` 打开后日志说「远端端点不可达」？**
+sccache 对不可达端点只会静默退回本地盘缓存，Hotpot 因此在 worker 启动时
+显式探测并告警。docker 后端下容器访问不到宿主回环地址，
+必须显式设置 `cache.sccache_webdav_url`（如 `http://host.docker.internal:7878/sccache`
+或 compose 内的服务名）。
+
+**Q：构建失败了，但 `error` 字段有用吗？**
+有用：失败时服务端会把最近 12 行 stderr 写进 `error` 字段
+（`error: Missing manifest in toolchain '1.60-…'` 这类真实诊断），
+不必再翻 SSE 日志。
+
 **Q：如何确认缓存真的命中？**
 sccache 用 `sccache --show-stats`；turbo 输出会显示 `FULL TURBO`；
 也可观察构建耗时与数据目录 `cacheproto.db` 条目增长。
 
 ## 13. 已知限制
 
-- 源码来源当前仅支持 `local`（git clone / 源码包上传在领域模型中预留，尚未实现）；
-- 构建 API 暂无认证与多租户配额；缓存协议端点同样不校验 token；
-- 执行期间状态保持 `dispatched`（未单独写入 `running`）；耗时仅 build/total 两段；
+- **构建 API 无鉴权**（缓存端点可用 `HOTPOT_CACHE_TOKEN` 启用 Bearer）。
+  对外暴露必须前置反向代理；
+- **git 来源构建默认关闭**：它会 clone 任意 URL 并执行其中的 `build.rs`/
+  proc-macro，等价于允许在服务进程权限下执行任意代码。需显式
+  `--allow-git-source`，且仅可在可信内网开启。源码包上传（`upload`）仍未实现；
+- **local 执行器没有隔离**：`build.rs` / proc-macro 可执行任意代码，
+  只适合可信内网与可信源码。docker 执行器提供容器边界，但仍共享 daemon socket；
+- **构建隔离**：会话 target 目录绝不跨项目共享，但同项目多次构建不复用 target
+  （加速依赖 sccache crate 层缓存与 CARGO_HOME）；
+- **artifact 不流式传输**：缓存协议层的 PUT/GET 目前整块进内存，
+  受 4 GiB `DefaultBodyLimit` 保护。超大 artifact 场景是明确的下一个优化点；
 - 产物采集固定为 profile 目录**顶层文件**（跳过 `.d` 与隐藏文件），暂不支持自定义 glob；
 - agent 的 fd 交接仅适用于 Unix；应用须遵循 `HOTPOT_LISTEN_FDS` 接入契约；
 - 单 SQLite + 内嵌 worker 为小团队形态；高可用/横向扩展见架构文档演进路线。

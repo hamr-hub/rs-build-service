@@ -4,6 +4,6 @@ pub mod remote;
 pub mod routes;
 pub mod state;
 
-pub use remote::{Namespace, RemoteCache};
+pub use remote::{CacheCounters, Namespace, NamespaceStats, RemoteCache};
 pub use routes::router;
-pub use state::CacheState;
+pub use state::{AuthState, CacheState, require_token};

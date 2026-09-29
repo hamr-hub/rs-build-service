@@ -24,6 +24,12 @@
 | F10 | 零停机部署 supervisor | hotpot-agent | ✅（Unix） |
 | F11 | 命令行客户端 | hotpot-cli | ✅ |
 | F12 | 错误模型 | hotpot-core/api | ✅ |
+| F13 | 工具链选择 | hotpot-core/worker | ✅ |
+| F14 | 构建列表与状态流转 | hotpot-scheduler/api | ✅ |
+| F15 | 指标暴露 | hotpot-api/cacheproto | ✅ |
+| F16 | 工具链发现 | hotpot-worker/api | ✅ |
+| F17 | 缓存端点鉴权 | hotpot-cacheproto | ✅ |
+| F18 | 源码 git 获取 | hotpot-api | ✅（默认关闭） |
 
 ---
 
@@ -44,8 +50,22 @@
 | kind | 字段 | 状态 |
 |------|------|------|
 | `local` | `path: String` | ✅ |
-| `git` | `url`, `ref_name`, `sha?` | 🟡 模型预留，提交返回 400 |
+| `git` | `url`, `ref_name`, `sha?` | ✅（需服务端 `--allow-git-source`） |
 | `upload` | `upload_id`, `root?` | 🟡 模型预留，提交返回 400 |
+
+### git 来源的边界（安全敏感）
+
+git 构建会 clone 任意 URL 并执行其中的 `build.rs` / proc-macro，
+**等价于允许在服务进程权限下执行任意代码**。因此：
+
+- 服务端必须显式 `--allow-git-source`（或 `HOTPOT_ALLOW_GIT_SOURCE=1`）才接受；
+  未开启时 API 直接返回 400，worker 侧再兜底一次（防止绕过 API 直接入队）；
+- 开启时服务端打印显式告警；
+- 字段校验：`url` / `ref_name` 非空且 ≤1024 字符；`sha` 必须是 1–64 位十六进制。
+
+浅克隆优先，失败回退 `init + fetch`；指定 `sha` 时若浅克隆的头不是该 sha，
+补一次 `git fetch origin <sha>` 并 checkout，最后 `rev-parse` 校验一致性——
+**不允许「检出到别的 commit 却报成功」**。
 
 ### 边界校验规则（系统边界，fail fast）
 
@@ -77,7 +97,7 @@
 | `no_default_features` | bool | false | 加 `--no-default-features` |
 | `target` | string? | null | 加 `--target <triple>`，并影响产物采集路径 |
 | `cargo_flags` | string[] | `[]` | 原样追加的额外参数 |
-| `toolchain` | string? | null | 预留（worker 默认工具链） |
+| `toolchain` | string? | null | Rust 工具链，见 F13 |
 
 ### 行为约束
 
@@ -127,7 +147,7 @@ UPDATE builds SET status='"dispatched"', leased_by=?, leased_until_ms=?
 ### 当前边界
 
 - 无项目/全局并发配额、无 worker registry（worker 仅以内嵌形态存在）；
-- 状态在执行期间保持 dispatched，未写 running。
+- 认领后立即写 `running`（M8，见 F14），因此 `dispatched` 只持续到执行权交接完成。
 
 ---
 
@@ -439,6 +459,143 @@ API 层 `ApiError` 映射为状态码 + JSON：
 
 ---
 
+---
+
+## F13. 工具链选择 ✅
+
+### 功能说明
+
+`profile.toolchain` 让每个构建显式选择 Rust 工具链，而不是隐式继承 worker 默认值。
+
+### 接受的写法（大小写不敏感）
+
+| 写法 | rustup 规格 | docker 标签 |
+|------|------------|------------|
+| `stable` / `beta` | 同名 | `rust:stable-slim-bookworm` |
+| `nightly` | `nightly` | `rust:nightly-slim-bookworm` |
+| `nightly-2026-01-15` | 同名 | `rust:nightly-2026-01-15-slim-bookworm` |
+| `1.98` | `1.98` | `rust:1.98-slim-bookworm` |
+| `1.98.0` | `1.98.0` | `rust:1.98.0-slim-bookworm` |
+
+### 校验（系统边界，fail fast）
+
+`validate_profile()` 在**提交时**校验，坏请求不占队列、不占 worker 槽位：
+
+- 工具链：非空、形状合法、nightly 日期为 `YYYY-MM-DD`；
+- target：至少两段、只含 `[A-Za-z0-9._-]`、长度 ≤256；
+- `features` / `cargo_flags`：每项 1–256 字符，条数 ≤64。
+
+worker 侧解析失败**不 panic**，而是发 `Stderr` 事件并以 `SpawnFailed` 结束
+（worker 也可被直接调用，不只经 API）。
+
+### 行为
+
+- local 后端：前置 `cargo +<spec>`；
+- docker 后端：把官方 `rust:` 镜像的版本段换成目标工具链，
+  保留变体后缀（`rust:1.98-slim-bookworm` + `1.99.0` → `rust:1.99.0-slim-bookworm`）。
+  **不匹配官方 rust 镜像时显式失败**并提示 `--docker-image`，
+  而不是静默用错工具链——工具链错配会让产物与缓存都不可移植。
+
+### 运维
+
+`GET /v1/toolchains` 列出宿主默认 `rustc`、已安装 rustup 工具链、
+docker daemon 已缓存的 `rust:` 镜像与 daemon 架构。**软失败**：
+盘点不全只进 `warnings`，不返回 5xx。
+
+---
+
+## F14. 构建列表与状态流转 ✅
+
+### `GET /v1/builds`
+
+| Query | 默认 | 说明 |
+|-------|------|------|
+| `status` | 全部 | 领域枚举的 JSON 形式（`succeeded` 等） |
+| `limit` | `50` | 1..=200（服务端 clamp） |
+| `offset` | `0` | 列表按 `created_at_ms DESC, id DESC` 排序 |
+
+### 状态流转
+
+```
+queued → dispatched → running → succeeded / failed / canceled / timeout
+```
+
+- 认领时置 `dispatched`（写租约）；**拿到执行权后立刻置 `running`**
+  （此前一直停在 `dispatched`，无法区分「已派发未开始」与「正在跑」）；
+- 终态由 `finish_build` 写入并释放租约。
+
+### 耗时分解
+
+`BuildTimings` 五段全部落库：`queue`（入队到开始执行）、`fetch`（源码就位，
+git clone 计入）、`build`、`upload`（产物采集入 CAS）、`total`。
+
+**构建失败时 `error` 字段写入最近 12 行 stderr**（而非笼统的
+`cargo build failed`），用户不必翻 SSE 日志才知道是依赖问题还是代码问题。
+
+---
+
+## F15. 指标暴露 ✅
+
+`GET /metrics`（Prometheus 文本格式）。设计取舍：**不维护进程内累计状态**，
+构建侧指标一律从 SQLite 现算，因此重启不会让 counter 回退（Prometheus 语义要求）。
+只有缓存命中/未命中是进程内 `AtomicU64`（`RemoteCache` 内），重启归零。
+
+| 指标 | 类型 | 含义 |
+|------|------|------|
+| `hotpot_builds_by_status{status}` | gauge | 各状态构建数 |
+| `hotpot_queue_depth` / `hotpot_queue_oldest_wait_ms` | gauge | 队列深度与最老任务等待时长 |
+| `hotpot_build_duration_ms_{sum,count,avg}{phase}` | counter/gauge | queue/build/total 阶段耗时 |
+| `hotpot_cache_{lookups,hits,misses,puts}_total{protocol}` | counter | 缓存查询（按协议分） |
+| `hotpot_cache_hit_ratio{protocol}` | gauge | 命中率（无查询时为 0） |
+| `hotpot_cache_index_{entries,bytes}{protocol}` | gauge | 索引条目数与逻辑字节 |
+| `hotpot_store_bytes` | gauge | CAS 磁盘占用 |
+| `hotpot_workers{executor}` | gauge | 内嵌 worker 数 |
+| `hotpot_info{version,toolchain,executor}` | gauge | 恒为 1，标注默认工具链 |
+
+label 值做 Prometheus 转义（`\`、`"`、换行）。
+
+---
+
+## F16. 工具链发现 ✅
+
+见 F13「运维」。实现位置：`crates/hotpot-worker/src/toolchains.rs`
+（`rustup toolchain list -v` 解析 + `rustc -vV` host triple 剥离 +
+`docker list_images` 过滤 `rust:` 前缀）。
+
+---
+
+## F17. 缓存端点鉴权 ✅
+
+### 动机
+
+缓存端点默认不鉴权是为单机零配置自托管。但一旦监听非回环地址，
+`PUT` 就是**构建供应链投毒面**：任何人都能写入伪造产物，之后所有机器都会命中。
+
+### 行为
+
+| 情况 | 行为 |
+|------|------|
+| 未设置 `HOTPOT_CACHE_TOKEN` | 放行（保持零配置） |
+| 已设置 + 缺失/错误 token | `401` + `WWW-Authenticate: Bearer` |
+| 已设置 + 正确 token | 放行 |
+
+- 常量时间字节比较，避免通过响应时间侧信道逐字节猜 token；
+- 监听非回环且未设 token 时，服务启动打印显式告警
+  （`0.0.0.0` / `::` 按「对外暴露」处理，只有回环算安全）；
+- 客户端侧：sccache 用 `SCCACHE_WEBDAV_TOKEN`，turbo 用 `TURBO_TOKEN`。
+  **两者都把 401 当硬错误而非 miss**——这是有意的 fail-fast：
+  token 配错表现为「构建直接失败」，比「命中率悄悄下降」更容易发现。
+
+---
+
+## F18. 源码 git 获取 ✅（默认关闭）
+
+见 F1「git 来源的边界」。要点：浅克隆优先 + `init/fetch` 回退、
+sha 补取与 `rev-parse` 一致性校验、fetch 阶段事件先落库并把 seq 传给执行器
+（`BuildPlan.first_seq`）保证单构建内 seq 全局单调。
+
+---
+
 ## 附：功能 → 里程碑对照
 
 | 里程碑 | 交付功能 |
@@ -451,3 +608,4 @@ API 层 `ApiError` 映射为状态码 + JSON：
 | M5 | F10 hotpot-agent 零停机部署 |
 | M6 | F9 hotpot-dev 热重载开发 |
 | M7 | docker 执行器、compose 发行、CI、文档 |
+| M8 | F13 工具链选择、F14 列表与状态流转、F15 指标、F16 工具链发现、F17 缓存鉴权、F18 git 来源、构建列表 CLI、失败原因诊断 |

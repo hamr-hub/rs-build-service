@@ -10,7 +10,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use hotpot_core::model::{BuildProfile, BuildRecord, SourceSpec};
+use hotpot_core::model::{BuildProfile, BuildRecord, BuildStatus, SourceSpec};
 use hotpot_core::{ContentDigest, EventKind};
 use hotpot_store::BlobStore;
 use serde::Deserialize;
@@ -24,18 +24,40 @@ const POLL_INTERVAL: Duration = Duration::from_millis(400);
 
 /// 构建应用路由。
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let metrics = crate::metrics::MetricsSource {
+        scheduler: state.scheduler.clone(),
+        store: state.store.clone(),
+        cache: state.cache.clone(),
+        workers: state.workers,
+        executor: format!("{:?}", state.executor),
+        toolchain: state.default_toolchain.clone(),
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    let toolchains = crate::toolchains::ToolchainState {
+        docker_host: match &*state.executor {
+            hotpot_worker::ExecutorKind::Docker { docker_host, .. } => docker_host.clone(),
+            hotpot_worker::ExecutorKind::Local => None,
+        },
+    };
+    // axum 的 `Router<S>` 每个 S 只能 `with_state` 一次，因此按状态分组
+    // 构造子路由再 merge——比把所有状态揉进 AppState 更清晰。
+    let builds = Router::new()
         .route("/healthz", get(healthz))
-        .route(
-            "/v1/builds",
-            post(create_build).get(list_builds_placeholder),
-        )
+        .route("/v1/builds", post(create_build).get(list_builds))
         .route("/v1/builds/{id}", get(get_build))
         .route("/v1/builds/{id}/logs/stream", get(logs_stream))
         .route("/v1/builds/{id}/cancel", post(cancel_build))
         .route("/v1/builds/{id}/artifacts", get(list_artifacts))
         .route("/v1/artifacts/{digest}", get(download_artifact))
-        .with_state(state)
+        .with_state(state);
+    let discovery = Router::new()
+        .route("/v1/toolchains", get(crate::toolchains::inventory))
+        .with_state(toolchains);
+    let observability = Router::new()
+        .route("/metrics", get(crate::metrics::handler))
+        .with_state(metrics);
+
+    builds.merge(discovery).merge(observability)
 }
 
 async fn healthz() -> &'static str {
@@ -53,15 +75,43 @@ async fn create_build(
     State(state): State<AppState>,
     Json(req): Json<CreateBuildRequest>,
 ) -> Result<(StatusCode, Json<BuildRecord>), ApiError> {
-    validate_source(&req.source)?;
-    let record = BuildRecord::queued(req.source, req.profile.unwrap_or_default());
+    validate_source(&req.source, state.allow_git_source)?;
+    let profile = req.profile.unwrap_or_default();
+    // 工具链写法、target 三元组形状、列表规模都在系统边界 fail fast：
+    // 坏请求不该排到队里再失败（那会浪费一个 worker 槽位并留下误导性记录）。
+    hotpot_core::toolchain::validate_profile(&profile).map_err(ApiError::from)?;
+    let record = BuildRecord::queued(req.source, profile);
     let record = state.scheduler.enqueue(record).await?;
     Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
-/// M2 未实现构建列表；显式返回 405 而非静默 404。
-async fn list_builds_placeholder() -> StatusCode {
-    StatusCode::METHOD_NOT_ALLOWED
+#[derive(Deserialize)]
+pub struct ListBuildsQuery {
+    /// 按状态过滤（省略则返回全部状态）。
+    #[serde(default)]
+    status: Option<BuildStatus>,
+    /// 返回条数（1..=200，默认 50）。
+    #[serde(default)]
+    limit: Option<u32>,
+    /// 偏移（默认 0）。列表按创建时间倒序，分页用 offset 足够。
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+/// 列出构建（按创建时间倒序）。
+async fn list_builds(
+    State(state): State<AppState>,
+    Query(query): Query<ListBuildsQuery>,
+) -> Result<Json<Vec<BuildRecord>>, ApiError> {
+    let builds = state
+        .scheduler
+        .list_builds(
+            query.status,
+            query.limit.unwrap_or(50),
+            query.offset.unwrap_or(0),
+        )
+        .await?;
+    Ok(Json(builds))
 }
 
 async fn get_build(
@@ -202,8 +252,16 @@ async fn download_artifact(
     Ok(response)
 }
 
-/// 在系统边界校验源码：M2 仅支持本机 Local 路径且必须是 Cargo 项目。
-fn validate_source(source: &SourceSpec) -> Result<(), ApiError> {
+/// 源码字段长度上限（防御超长输入）。
+const MAX_SOURCE_FIELD: usize = 1024;
+
+/// 在系统边界校验源码。
+///
+/// - `local`：路径必须存在且含 `Cargo.toml`（fail fast，不让坏请求占队列）；
+/// - `git`：仅在服务端显式允许时接受，并校验 url/ref 非空与长度；
+///   **未开启时直接 400**，因为这类构建会执行不可信仓库中的代码；
+/// - `upload`：尚未实现，明确拒绝。
+fn validate_source(source: &SourceSpec, allow_git_source: bool) -> Result<(), ApiError> {
     match source {
         SourceSpec::Local { path } => {
             let p = Path::new(path);
@@ -219,9 +277,42 @@ fn validate_source(source: &SourceSpec) -> Result<(), ApiError> {
             }
             Ok(())
         }
-        other => Err(ApiError::bad_request(format!(
-            "source kind not supported yet: {}",
-            serde_json::to_string(other).unwrap_or_default()
+        SourceSpec::Git { url, ref_name, sha } => {
+            if !allow_git_source {
+                return Err(ApiError::bad_request(
+                    "git source builds are disabled on this server; \
+                     start it with --allow-git-source to enable"
+                        .to_string(),
+                ));
+            }
+            for (name, value) in [("url", url), ("ref_name", ref_name)] {
+                if value.trim().is_empty() {
+                    return Err(ApiError::bad_request(format!(
+                        "git {name} must not be empty"
+                    )));
+                }
+                if value.len() > MAX_SOURCE_FIELD {
+                    return Err(ApiError::bad_request(format!(
+                        "git {name} must be at most {MAX_SOURCE_FIELD} chars"
+                    )));
+                }
+            }
+            if let Some(sha) = sha {
+                if sha.trim().is_empty() || sha.len() > 64 {
+                    return Err(ApiError::bad_request(
+                        "git sha must be 1-64 hex chars".to_string(),
+                    ));
+                }
+                if !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(ApiError::bad_request(
+                        "git sha must be hexadecimal".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        SourceSpec::Upload { upload_id, .. } => Err(ApiError::bad_request(format!(
+            "upload source is not supported yet (upload_id={upload_id})"
         ))),
     }
 }

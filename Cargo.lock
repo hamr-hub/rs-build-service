@@ -878,6 +878,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "toml",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -898,6 +899,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -985,7 +987,10 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "hex",
  "hotpot-core",
+ "serde",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

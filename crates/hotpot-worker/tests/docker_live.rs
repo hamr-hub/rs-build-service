@@ -202,3 +202,37 @@ async fn docker_build_cancel() {
         "cancel 后容器应被杀掉并返回 Canceled"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docker_partial_toolchain_uses_preinstalled_image_toolchain() {
+    if !docker_available().await {
+        eprintln!("skip: docker daemon unreachable");
+        return;
+    }
+
+    let tmp = test_tempdir();
+    let project = tmp.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    fixture(&project, "fn main() {}\n");
+
+    let session = tmp.path().join("session");
+    let mut plan = BuildPlan::local(&project, &session);
+    plan.timeout = Duration::from_secs(300);
+    // 部分版本号 spec：镜像里预装的是 1.85.x-<host>，`+1.85` 若不链接会触发下载。
+    plan.profile.toolchain = Some("1.85".to_string());
+
+    let (events, handle) = run_build(plan, &docker_executor()).await;
+    let logs = tokio::task::spawn_blocking(|| drain(events)).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(300), handle)
+        .await
+        .expect("join timed out")
+        .unwrap();
+
+    assert!(result.success, "构建应成功；events:\n{}", logs.join("\n"));
+    // 回归：不得出现 rustup 联网同步工具链（镜像预热必须被复用）。
+    assert!(
+        logs.iter().none(|l| l.contains("syncing channel updates")),
+        "不应触发 rustup 下载工具链；events:\n{}",
+        logs.join("\n")
+    );
+}

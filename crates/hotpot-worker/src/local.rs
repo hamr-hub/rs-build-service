@@ -27,10 +27,34 @@ pub fn run_local(
 }
 
 async fn run_inner(plan: BuildPlan, tx: mpsc::Sender<BuildEvent>) -> BuildResult {
-    let seq = Arc::new(AtomicU64::new(0));
+    let seq = Arc::new(AtomicU64::new(plan.first_seq));
     let started = Instant::now();
 
+    // 工具链解析失败不应 panic：API 边界已校验，但 worker 也可被直接调用。
+    let toolchain = match plan.profile.toolchain.as_deref() {
+        Some(raw) => match hotpot_core::parse_toolchain(raw) {
+            Ok(tc) => Some(tc),
+            Err(e) => {
+                emit_event(
+                    &tx,
+                    &seq,
+                    &plan.build_id,
+                    EventKind::Stderr,
+                    format!("invalid toolchain '{raw}': {e}"),
+                )
+                .await;
+                return BuildResult {
+                    success: false,
+                    exit_code: None,
+                    end_reason: EndReason::SpawnFailed,
+                    timings: build_timings(&started),
+                };
+            }
+        },
+        None => None,
+    };
     let (args, extra_env) = cargo_invocation(
+        toolchain.as_ref(),
         &plan.profile,
         plan.sccache_dir.as_deref(),
         plan.sccache_bin.as_deref(),
@@ -43,7 +67,8 @@ async fn run_inner(plan: BuildPlan, tx: mpsc::Sender<BuildEvent>) -> BuildResult
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("CARGO_TARGET_DIR", &plan.target_dir)
-        .envs(extra_env);
+        .envs(extra_env)
+        .envs(plan.extra_env.clone());
 
     emit_phase(&tx, &seq, &plan.build_id, "build started").await;
     debug!(?plan, "spawning cargo");

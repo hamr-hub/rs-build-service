@@ -26,8 +26,13 @@ use super::executor::{BuildPlan, BuildResult, EndReason, cargo_invocation};
 const WORKSPACE: &str = "/workspace";
 const TARGET_MOUNT: &str = "/target";
 const SCCACHE_MOUNT: &str = "/sccache";
+/// 容器专用 CARGO_HOME（registry/git 缓存，跨构建复用）。
+const CARGO_HOME_MOUNT: &str = "/cargo";
+/// 预取 sccache 二进制的单文件挂载点。
+const SCCACHE_BIN_MOUNT: &str = "/opt/sccache/sccache";
 
-const CONNECT_TIMEOUT_SECS: u64 = 30;
+/// daemon 连接超时（探测各候选 socket 时共用）。
+pub(crate) const CONNECT_TIMEOUT_SECS: u64 = 30;
 /// 停止后等待容器真正退出的回收窗口。
 const RECLAIM_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -53,8 +58,62 @@ async fn run_inner(
     docker_host: Option<String>,
     tx: mpsc::Sender<BuildEvent>,
 ) -> BuildResult {
-    let seq = Arc::new(AtomicU64::new(0));
+    let seq = Arc::new(AtomicU64::new(plan.first_seq));
     let started = Instant::now();
+
+    // 工具链：API 边界已校验，这里解析失败属内部不一致，显式失败而非 panic。
+    let toolchain = match plan.profile.toolchain.as_deref() {
+        Some(raw) => match hotpot_core::parse_toolchain(raw) {
+            Ok(tc) => Some(tc),
+            Err(e) => {
+                emit_event(
+                    &tx,
+                    &seq,
+                    &plan.build_id,
+                    EventKind::Stderr,
+                    format!("invalid toolchain '{raw}': {e}"),
+                )
+                .await;
+                return failed(&started, EndReason::SpawnFailed, None);
+            }
+        },
+        None => None,
+    };
+
+    // 指定工具链时把官方 rust 镜像的版本段换成目标工具链，
+    // 保证「宿主工具链」与「容器工具链」一致，否则产物与缓存都不可移植。
+    let image = match &toolchain {
+        Some(tc) => match resolve_image(&image, tc) {
+            Some(resolved) => {
+                if resolved != image {
+                    emit_phase(
+                        &tx,
+                        &seq,
+                        &plan.build_id,
+                        &format!("toolchain image {resolved}"),
+                    )
+                    .await;
+                }
+                resolved
+            }
+            None => {
+                emit_event(
+                    &tx,
+                    &seq,
+                    &plan.build_id,
+                    EventKind::Stderr,
+                    format!(
+                        "toolchain '{}' requested but image '{image}' is not an official rust \
+                         image; pass --docker-image to pin a matching image",
+                        tc.rustup_spec()
+                    ),
+                )
+                .await;
+                return failed(&started, EndReason::SpawnFailed, None);
+            }
+        },
+        None => image,
+    };
 
     let docker = match connect(docker_host.as_deref()).await {
         Ok(d) => d,
@@ -82,6 +141,14 @@ async fn run_inner(
         .await;
         return failed(&started, EndReason::SpawnFailed, None);
     }
+
+    // daemon 架构（决定下载哪个 sccache）；探测失败退回编译机架构。
+    let arch = docker
+        .info()
+        .await
+        .ok()
+        .and_then(|info| info.architecture)
+        .unwrap_or_else(|| std::env::consts::ARCH.to_string());
 
     // 挂载源路径（必须绝对路径；macOS colima 下 /tmp、/Users 在 VM 内可见）。
     let project = match plan.project_dir.canonicalize() {
@@ -119,14 +186,55 @@ async fn run_inner(
         .as_ref()
         .and_then(|d| d.canonicalize().ok());
 
-    // 容器内 sccache 命令名固定为 sccache（镜像须提供）；缓存目录指向挂载点。
+    // 容器专用 CARGO_HOME：跨构建复用 registry/git 缓存（容器平台固定故可安全共享；
+    // **不可**复用宿主 CARGO_HOME——其 toolchain/registry 是宿主平台的）。
+    if let Some(dir) = &plan.cargo_home {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let cargo_home = plan.cargo_home.as_ref().and_then(|d| d.canonicalize().ok());
+
+    // sccache 供给：按 daemon 架构从 tools 目录取预取好的 Linux 二进制，
+    // 以单文件 bind 方式挂入；失败时退回镜像 PATH 内的 sccache（若镜像自带）。
+    let mut sccache_host_bin = None;
+    let mut sccache_container_bin: Option<&Path> = None;
+    if sccache.is_some() {
+        if let Some(tools_dir) = &plan.tools_dir {
+            std::fs::create_dir_all(tools_dir).ok();
+            if let Ok(tools_dir) = tools_dir.canonicalize() {
+                match super::tools::ensure_sccache(&tools_dir, &arch).await {
+                    Ok(bin) => {
+                        emit_phase(
+                            &tx,
+                            &seq,
+                            &plan.build_id,
+                            &format!("sccache ready ({arch})"),
+                        )
+                        .await;
+                        sccache_host_bin = Some(bin);
+                        sccache_container_bin = Some(Path::new(SCCACHE_BIN_MOUNT));
+                    }
+                    Err(e) => {
+                        emit_event(
+                            &tx,
+                            &seq,
+                            &plan.build_id,
+                            EventKind::Stderr,
+                            format!("provision sccache failed ({e}); falling back to image PATH"),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    // 缓存目录指向挂载点；显式容器路径优先，其次 profile 给定，最后假定镜像提供。
     let (args, extra_env) = {
         let cache_dir = sccache.as_ref().map(|_| Path::new(SCCACHE_MOUNT));
-        let bin = plan
-            .sccache_bin
-            .as_deref()
+        let bin = sccache_container_bin
+            .or(plan.sccache_bin.as_deref())
             .or_else(|| cache_dir.map(|_| Path::new("sccache")));
-        cargo_invocation(&plan.profile, cache_dir, bin)
+        cargo_invocation(toolchain.as_ref(), &plan.profile, cache_dir, bin)
     };
 
     let mut binds = vec![
@@ -136,10 +244,20 @@ async fn run_inner(
     if let Some(dir) = &sccache {
         binds.push(format!("{}:{SCCACHE_MOUNT}", dir.display()));
     }
+    if let Some(bin) = &sccache_host_bin {
+        binds.push(format!("{}:{SCCACHE_BIN_MOUNT}", bin.display()));
+    }
+    if let Some(dir) = &cargo_home {
+        binds.push(format!("{}:{CARGO_HOME_MOUNT}", dir.display()));
+    }
 
     let env = {
         let mut vars = vec![format!("CARGO_TARGET_DIR={TARGET_MOUNT}")];
         vars.extend(extra_env.iter().map(|(k, v)| format!("{k}={v}")));
+        vars.extend(plan.extra_env.iter().map(|(k, v)| format!("{k}={v}")));
+        if cargo_home.is_some() {
+            vars.push(format!("CARGO_HOME={CARGO_HOME_MOUNT}"));
+        }
         vars
     };
 
@@ -148,13 +266,51 @@ async fn run_inner(
         plan.build_id,
         started.elapsed().as_nanos()
     );
+    // 需要容器内预处理时把入口换成 shell（否则直接 exec cargo）：
+    // - 指定 toolchain：官方镜像预装的工具链名是「精确版本+host triple」，
+    //   `cargo +1.85` 会被 rustup 当作新 spec，触发联网下载最新 1.85.x（镜像
+    //   预热完全失效，每个构建多下数百 MB）。因此把 spec 链接到镜像默认
+    //   工具链；已能用该 spec 直接运行（精确版本/带日期 nightly）则跳过。
+    // - 交叉 target：先装 target 组件再执行 cargo。
+    let mut cmd: Vec<String> = std::iter::once("cargo".to_string()).chain(args).collect();
+    let mut setup_steps: Vec<String> = Vec::new();
+    if let Some(tc) = &toolchain {
+        let spec = sh_quote(&tc.rustup_spec());
+        setup_steps.push(format!(
+            "if rustup run {spec} rustc --version >/dev/null 2>&1; then :; else \
+             tc_root=\"$(dirname \"$(dirname \"$(rustup which rustc)\")\"; \
+             rustup toolchain link {spec} \"$tc_root\"; fi"
+        ));
+    }
+    if let Some(target) = plan.profile.target.as_deref() {
+        let mut step = String::from("rustup target add");
+        if let Some(tc) = &toolchain {
+            step.push_str(" --toolchain ");
+            step.push_str(&sh_quote(&tc.rustup_spec()));
+        }
+        step.push(' ');
+        step.push_str(&sh_quote(target));
+        setup_steps.push(step);
+    }
+    if !setup_steps.is_empty() {
+        let quoted = cmd
+            .iter()
+            .map(|part| sh_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = format!("{} && exec {quoted}", setup_steps.join(" && "));
+        cmd = vec!["sh".to_string(), "-c".to_string(), script];
+    }
+
     let config = Config {
         image: Some(image.clone()),
         working_dir: Some(WORKSPACE.to_string()),
-        cmd: Some(std::iter::once("cargo".to_string()).chain(args).collect()),
+        cmd: Some(cmd),
         env: Some(env),
         host_config: Some(HostConfig {
             binds: Some(binds),
+            // 让构建容器可经 host.docker.internal 访问宿主服务（sccache 远端等）。
+            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             ..Default::default()
         }),
         ..Default::default()
@@ -444,7 +600,19 @@ async fn connect(docker_host: Option<&str>) -> Result<Docker, String> {
     Err("no reachable docker daemon (tried defaults and common sockets)".to_string())
 }
 
-async fn connect_uri(host: &str) -> Result<Docker, String> {
+/// 查询 daemon 报告的 CPU 架构（`x86_64` / `aarch64`）。
+/// 预取容器内工具（如 sccache）时必须按 **daemon 架构**而非宿主架构选资产。
+pub async fn daemon_arch(docker_host: Option<&str>) -> Result<String, String> {
+    let docker = connect(docker_host).await?;
+    let info = docker
+        .info()
+        .await
+        .map_err(|e| format!("docker info: {e}"))?;
+    Ok(info.architecture.unwrap_or_default())
+}
+
+/// 按 URI 形态连接 daemon（unix:// / http:// / 其他）。
+pub(crate) async fn connect_uri(host: &str) -> Result<Docker, String> {
     let d = if let Some(socket) = host.strip_prefix("unix://") {
         Docker::connect_with_unix(socket, CONNECT_TIMEOUT_SECS, API_DEFAULT_VERSION)
     } else if host.starts_with("http://") || host.starts_with("https://") {
@@ -503,4 +671,90 @@ async fn emit_event(
     };
     // 接收方消失则丢弃（构建已无人关注）。
     let _ = tx.send(event).await;
+}
+
+/// POSIX shell 单引号转义（供容器内 `sh -c` 脚本使用）。
+fn sh_quote(s: &str) -> String {
+    let mut out = String::from("'");
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// 官方 `rust` 镜像按工具链换版本段：`rust:1.98-slim-bookworm` + `1.99.0`
+/// → `rust:1.99.0-slim-bookworm`。非官方镜像（或标签形状不符）返回 None，
+/// 由调用方显式报错，而不是静默用错工具链。
+fn resolve_image(image: &str, toolchain: &hotpot_core::ToolchainRequest) -> Option<String> {
+    let (repo, tag) = image.split_once(':')?;
+    if repo != "rust" {
+        return None;
+    }
+    // 标签形如 `1.98-slim-bookworm` / `stable-slim` / `slim-bookworm`（无版本段）。
+    // 变体推导必须只剥离**工具链版本段**：`slim-bookworm` 首段 "slim" 不是版本，
+    // 按首个 '-' 切会误得变体 "bookworm"（拉成无 slim 的数 GB 全量镜像）。
+    let spec_prefix = format!("{}-", toolchain.rustup_spec());
+    let variant = tag
+        .strip_prefix(&spec_prefix)
+        .unwrap_or_else(|| match tag.split_once('-') {
+            Some((head, rest)) if hotpot_core::parse_toolchain(head).is_ok() => rest,
+            _ => tag,
+        });
+    Some(toolchain.docker_tag(variant))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_image;
+    use hotpot_core::parse_toolchain;
+
+    fn resolve(image: &str, spec: &str) -> Option<String> {
+        resolve_image(image, &parse_toolchain(spec).unwrap())
+    }
+
+    #[test]
+    fn bare_variant_tag_is_kept_whole() {
+        // 回归：`slim-bookworm` 不是「版本 + 变体」，曾被误切成变体 "bookworm"。
+        assert_eq!(
+            resolve("rust:slim-bookworm", "1.85"),
+            Some("rust:1.85-slim-bookworm".to_string())
+        );
+        assert_eq!(
+            resolve("rust:bookworm", "1.98"),
+            Some("rust:1.98-bookworm".to_string())
+        );
+    }
+
+    #[test]
+    fn versioned_tag_strips_only_version_segment() {
+        assert_eq!(
+            resolve("rust:1.98-slim-bookworm", "1.85"),
+            Some("rust:1.85-slim-bookworm".to_string())
+        );
+        assert_eq!(
+            resolve("rust:stable-slim", "beta"),
+            Some("rust:beta-slim".to_string())
+        );
+    }
+
+    #[test]
+    fn dated_nightly_tag_matches_full_spec() {
+        assert_eq!(
+            resolve(
+                "rust:nightly-2026-01-15-slim-bookworm",
+                "nightly-2026-01-15"
+            ),
+            Some("rust:nightly-2026-01-15-slim-bookworm".to_string())
+        );
+    }
+
+    #[test]
+    fn non_rust_repo_is_rejected() {
+        assert_eq!(resolve("myregistry/rust:slim", "1.85"), None);
+    }
 }

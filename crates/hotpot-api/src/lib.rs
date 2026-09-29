@@ -2,8 +2,11 @@
 
 pub mod driver;
 pub mod error;
+pub mod metrics;
 pub mod routes;
+pub mod source;
 pub mod state;
+pub mod toolchains;
 
 pub use routes::router;
 pub use state::AppState;

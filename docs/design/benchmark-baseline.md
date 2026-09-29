@@ -133,3 +133,89 @@ hotpot-worker docker executor（bollard）：项目/target/sccache 三个 bind
 | 发行 | `docker compose up -d`（兄弟容器同路径挂载）；GitHub Actions 三 job CI |
 
 （后续 Hotpot 的所有加速效果都以该基线为对照记录。）
+
+## M8：协议加固与能力补齐（2026-09-29）
+
+M0–M7 记录的是「功能是否存在」；M8 记录的是「协议语义是否正确、失败是否可见」。
+
+### 8.1 协议契约测试（16 项，此前为 0）
+
+`crates/hotpot-cacheproto/tests/routes.rs` 在 HTTP 层锁死两套协议的语义。
+此前只有 `RemoteCache` 的存储层测试，**协议兼容的失败模式全是静默的**，
+没有回归网。
+
+| 契约 | 为什么重要 |
+|------|-----------|
+| sccache `.sccache_check`：`GET`→404 / `PUT`→204，且不落盘 | PUT 非 2xx 会让 sccache **静默降级只读**，远端写入全丢且不报错 |
+| sccache 三层分片 key `ab/cd/<60 hex>` 往返 | key 归一化（如把 `/` 换成 `_`）会**静默破坏**全部历史条目 |
+| sccache `Content-Length` 与 body 严格一致 | sccache 把长度参与签名计算，不符即验签失败 |
+| sccache `PROPFIND`→207 + `getlastmodified` + `href` XML 转义 | opendal 靠该元素存在性判断解析成功；非法 XML → 写前探测失败 → 只读 |
+| turbo `x-artifact-tag` 必回显 | 签名客户端缺 tag 是**硬错误**（`ArtifactTagMissing`），不是 miss |
+| turbo 已有条目补齐缺失 tag | 「先无签名上传、后启用签名」会导致该客户端永久硬错误 |
+| turbo 租户隔离：不同 `teamId`/`slug` 一律 404 | 404 是**唯一** miss 信号；403/500 会让 turbo 中断构建 |
+| turbo `HEAD` 返回真实 `Content-Length` | spec 为 HEAD 200 声明了该头 |
+| turbo `OPTIONS` 预检 | `--preflight` 下 405 会让预检失败 |
+
+### 8.2 实测：缓存端点鉴权
+
+服务端 `HOTPOT_CACHE_TOKEN=secret-token`，端到端 curl：
+
+| 场景 | 结果 |
+|------|------|
+| `/sccache/{key}` 无 token | `401` |
+| `/sccache/{key}` 带正确 token（未命中） | `404` |
+| `/v8/artifacts/{hash}` 无 token | `401` |
+| `.sccache_check` GET / PUT | `404` / `204` |
+| sccache 三层 key PUT / GET | `204` / `200`（body 逐字节一致） |
+| sccache PROPFIND / MKCOL | `207` / `201` |
+| turbo PUT team_a | `201` |
+| turbo GET team_a | `200`，回显 `x-artifact-tag` / `x-artifact-duration` / `x-artifact-sha` |
+| turbo GET team_b（不同租户） | `404` |
+| turbo HEAD / OPTIONS | `200` / `204` |
+
+### 8.3 实测：工具链选择（F13）
+
+以无依赖的最小项目验证（排除网络与依赖解析噪声）：
+
+| `profile.toolchain` | 结果 | 说明 |
+|--------------------|------|------|
+| `1.93` | succeeded | 本机已安装 |
+| `stable` | succeeded | |
+| `1.60`（未安装） | **failed** | `error: Missing manifest in toolchain '1.60-aarch64-apple-darwin'` |
+| `1.98.x` | `400` | 边界校验：`invalid rust version '1.98.x'` |
+| `nightly-2099-1-1` | `400` | 边界校验：日期必须是 `YYYY-MM-DD` |
+| `target: "noseparator"` | `400` | 边界校验：target 三元组形状 |
+
+**关键点**：未安装的工具链**明确失败**而不是静默回落到默认工具链——
+工具链错配会让产物与缓存都不可移植，静默回落是最坏的失败方式。
+同时 `error` 字段现在直接携带真实 rustc 诊断（此前只有 `cargo build failed`）。
+
+### 8.4 实测：新端点
+
+```
+GET /v1/builds?limit=5
+BUILD                                  STATUS       BUILD_MS  TOTAL_MS  SOURCE
+bld_80730145-…                         succeeded       19862     20479  local:demo-webapp
+
+GET /metrics   （节选）
+hotpot_builds_by_status{status="succeeded"} 2
+hotpot_queue_depth{} 0
+hotpot_cache_hits_total{protocol="sccache"} 0
+hotpot_cache_hit_ratio{protocol="turbo"} 0
+hotpot_store_bytes{} 7087583
+hotpot_info{version="0.1.0",toolchain="rustc 1.98.0 (88d9e12ae 2026-08-18)",executor="Local"} 1
+
+GET /v1/toolchains
+default: rustc 1.98.0 (88d9e12ae 2026-08-18)
+local toolchains:  stable / 1.93 / 1.98.0
+docker images:     rust:1.85-slim-bookworm / rust:1.98-slim-bookworm
+```
+
+### 8.5 质量门禁
+
+| 检查 | 结果 |
+|------|------|
+| `cargo build --workspace` | 通过 |
+| `cargo clippy --workspace --all-targets` | 0 warning |
+| `cargo test --workspace` | 全部通过（新增协议契约测试 16 项） |
+| `cargo fmt --all` | 通过 |
