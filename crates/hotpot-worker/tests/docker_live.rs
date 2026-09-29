@@ -231,7 +231,7 @@ async fn docker_partial_toolchain_uses_preinstalled_image_toolchain() {
     assert!(result.success, "构建应成功；events:\n{}", logs.join("\n"));
     // 回归：不得出现 rustup 联网同步工具链（镜像预热必须被复用）。
     assert!(
-        logs.iter().none(|l| l.contains("syncing channel updates")),
+        !logs.iter().any(|l| l.contains("syncing channel updates")),
         "不应触发 rustup 下载工具链；events:\n{}",
         logs.join("\n")
     );
