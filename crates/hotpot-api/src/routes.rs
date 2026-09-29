@@ -20,7 +20,13 @@ use crate::error::{ApiError, parse_build_id};
 use crate::state::AppState;
 
 const EVENT_BATCH: u32 = 512;
-const POLL_INTERVAL: Duration = Duration::from_millis(400);
+
+/// SSE 的**兜底**轮询间隔，不是常规节奏。
+///
+/// 常规情况下 worker 写完事件就广播，流立刻被唤醒，这个值一次都用不到；
+/// 它只在信号丢失时兜底（见 `logs_stream` 注释）。因此可以放得比较宽：
+/// 兜底本就不该承担时效性，放宽换来的是异常时更低的数据库压力。
+const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// 构建应用路由。
 pub fn router(state: AppState) -> Router {
@@ -145,27 +151,36 @@ async fn logs_stream(
 
     let state = state.clone();
     let stream = async_stream::stream! {
+        // ---- 订阅必须早于补齐 ----
+        // 顺序反了会漏事件：先补齐、后订阅的话，两者之间写入的事件既不在
+        // 补齐结果里，也不会推给刚建立的订阅。先订阅再补齐，配合下面按
+        // `cursor` 去重，窗口期的事件会被补齐捞到、广播里的重复被丢弃。
+        let mut signals = state.subscribe();
         let mut cursor = query.since.unwrap_or(0);
+
         loop {
-            let events = state
-                .scheduler
-                .list_events(build_id, cursor, EVENT_BATCH)
-                .await;
-            match events {
-                Ok(events) => {
-                    for event in events {
-                        cursor = event.seq + 1;
-                        let data = serde_json::to_string(&event).unwrap_or_default();
-                        yield Ok(Event::default().event(event_name(event.kind)).data(data));
+            // 1) 从库里把游标之后的事件全部补齐（也覆盖断线期间的缺口）。
+            let mut drained = false;
+            loop {
+                match state.scheduler.list_events(build_id, cursor, EVENT_BATCH).await {
+                    Ok(events) if events.is_empty() => break,
+                    Ok(events) => {
+                        for event in events {
+                            cursor = event.seq + 1;
+                            let data = serde_json::to_string(&event).unwrap_or_default();
+                            yield Ok(Event::default().event(event_name(event.kind)).data(data));
+                            drained = true;
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!("sse list_events failed: {e}");
-                    yield Ok(Event::default().event("error").data(e.to_string()));
-                    break;
+                    Err(e) => {
+                        warn!("sse list_events failed: {e}");
+                        yield Ok(Event::default().event("error").data(e.to_string()));
+                        return;
+                    }
                 }
             }
 
+            // 2) 终态检查：必须在"补齐之后"，否则最后一批事件会被 end 截断。
             let terminal = state
                 .scheduler
                 .get_build(build_id)
@@ -178,7 +193,32 @@ async fn logs_stream(
                 yield Ok(Event::default().event("end").data("{}"));
                 break;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            // 刚补过一轮就继续等，避免立刻空转。
+            if drained {
+                continue;
+            }
+
+            // 3) 等广播唤醒，而不是定时轮询。
+            //
+            // `POLL_INTERVAL` 从"固定 400ms 轮询"退化为**兜底**：正常情况下
+            // worker 写完事件立刻广播，这里一次都不会超时；只有信号丢失
+            // （订阅建立前的极窄窗口、进程异常）才会退化成慢轮询。
+            // 这就是并发上的关键差别：查询量不再随观看人数线性增长。
+            match tokio::time::timeout(POLL_INTERVAL, signals.recv()).await {
+                // 收到信号 → 回到顶部补齐。
+                Ok(Ok(_)) => continue,
+                // 慢订阅者被丢包：无所谓，游标补齐会把漏掉的全部捞回来。
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                    tracing::debug!(build = %build_id, skipped, "sse subscriber lagged; backfilling");
+                    continue;
+                }
+                // 发送端全没了（不该发生）：退化为纯轮询，功能不受影响。
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                // 兜底超时：再查一次库，确认不是信号丢了。
+                Err(_) => {}
+            }
         }
     };
 

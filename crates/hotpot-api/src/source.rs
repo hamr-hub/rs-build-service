@@ -11,14 +11,17 @@ use tokio::process::Command;
 /// 阶段事件发射器：保持 seq 在 fetch 阶段与后续执行器之间连续。
 pub(super) struct PhaseSink<'a> {
     scheduler: &'a hotpot_scheduler::Scheduler,
+    /// 用于把事件广播给 SSE 订阅者（拉源码阶段的事件也要实时可见）。
+    state: &'a crate::AppState,
     build_id: BuildId,
     next_seq: u64,
 }
 
 impl<'a> PhaseSink<'a> {
-    pub(super) fn new(scheduler: &'a hotpot_scheduler::Scheduler, build_id: BuildId) -> Self {
+    pub(super) fn new(state: &'a crate::AppState, build_id: BuildId) -> Self {
         Self {
-            scheduler,
+            scheduler: &state.scheduler,
+            state,
             build_id,
             next_seq: 0,
         }
@@ -50,7 +53,10 @@ impl<'a> PhaseSink<'a> {
             payload,
         };
         self.next_seq += 1;
-        self.scheduler.append_event(&event).await
+        self.scheduler.append_event(&event).await?;
+        // 与 driver 同一套广播，否则"拉源码"阶段的事件不会实时到达前端。
+        self.state.publish(crate::state::StreamSignal::Log(event));
+        Ok(())
     }
 }
 

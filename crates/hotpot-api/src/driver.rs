@@ -20,6 +20,23 @@ use crate::state::AppState;
 
 const LEASE: Duration = Duration::from_secs(60);
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(15);
+
+/// 续租任务句柄：离开作用域即中止。
+///
+/// 续租原本写成「末尾一句 `renew_task.abort()`」，而 `handle_build` 中间有
+/// 多个 `?`（`mark_running`、`run_build` 的 join……）。任何一处提前返回都会
+/// 把续租任务留在后台：它每 15s 续一次租约，而构建再也不会被推进。
+/// 租约机制的本意是「worker 失活后任务能被接管」，这条路径反而让任务
+/// 永远停在 `dispatched` 且不可接管——一个瞬时 DB 错误变成永久卡死。
+///
+/// RAII 让「函数怎么退出，续租都一定停」成为类型层面的保证。
+struct LeaseRenewer(tokio::task::JoinHandle<()>);
+
+impl Drop for LeaseRenewer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// 构建失败时写进 `error` 字段的 stderr 尾部行数。
 const ERROR_TAIL_LINES: usize = 12;
@@ -144,7 +161,7 @@ async fn handle_build(
 
     // ---- 源码就位（fetch 阶段；Local 无 IO，Git 在会话目录内 clone）----
     let fetch_started = Instant::now();
-    let mut sink = PhaseSink::new(&state.scheduler, rec.id);
+    let mut sink = PhaseSink::new(state, rec.id);
     // 共享 git 工作区需要全构建周期持锁（见 git_project_lock）；guard 在
     // 函数结束时自动释放。会话级 clone 无需加锁。
     // 只需要守卫在函数结束时 drop 释放锁，无需读取；下划线前缀保留 Drop。
@@ -221,7 +238,8 @@ async fn handle_build(
     // 长构建期间续租，防止失活接管触发重复执行。
     let renew_state = state.clone();
     let renew_worker = worker_id.to_string();
-    let renew_task = tokio::spawn(async move {
+    // `LeaseRenewer` 在任何返回路径（含 `?` 与 panic 展开）上都会中止续租。
+    let _renewer = LeaseRenewer(tokio::spawn(async move {
         loop {
             tokio::time::sleep(LEASE_RENEW_INTERVAL).await;
             if let Err(e) = renew_state
@@ -232,10 +250,11 @@ async fn handle_build(
                 warn!("renew lease failed: {e}");
             }
         }
-    });
+    }));
 
     let queue_ms = millis_since(rec.created_at_ms);
     state.scheduler.mark_running(rec.id).await?;
+    state.publish(crate::state::StreamSignal::Status(rec.id));
     info!(build = %rec.id.short(), mode = ?rec.profile.mode, "running build");
     let (mut events, job) = run_build(plan, executor).await;
     // 保留最近若干条 stderr：构建失败时直接写进 error 字段，
@@ -250,12 +269,14 @@ async fn handle_build(
         }
         if let Err(e) = state.scheduler.append_event(&event).await {
             warn!("persist event failed: {e}");
+        } else {
+            // 写库成功才广播：否则订阅者会被唤醒去读一个还不存在的 seq。
+            state.publish(crate::state::StreamSignal::Log(event.clone()));
         }
     }
     let result = job
         .await
         .map_err(|e| hotpot_core::Error::Other(e.to_string()))?;
-    renew_task.abort();
     state.remove_cancel(rec.id).await;
 
     let mut status = match result.end_reason {
@@ -303,6 +324,8 @@ async fn handle_build(
         .scheduler
         .finish_build(rec.id, status, timings, error)
         .await?;
+    // 终态必须唤醒订阅者，否则它们会一直等着（没有新事件可推送）。
+    state.publish(crate::state::StreamSignal::Status(rec.id));
     info!(build = %rec.id.short(), ?status, artifact_cnt = artifacts.len(), "build finished");
     Ok(())
 }

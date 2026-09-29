@@ -18,12 +18,12 @@ use axum::Router;
 use axum::extract::Request;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use tokio::sync::Semaphore;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 /// 日志流路径。SSE 相关的豁免判定都以它为准。
 const SSE_PATH: &str = "/logs/stream";
@@ -245,7 +245,28 @@ pub fn body_limit_layer(max_bytes: usize) -> RequestBodyLimitLayer {
     RequestBodyLimitLayer::new(max_bytes)
 }
 
-/// 挂载前端静态资源（含 SPA 回退）。
+/// 读取并返回 `index.html`。
+///
+/// 状态码必须是 **200**：`ServeDir::not_found_service` 会原样保留 404，
+/// 虽然 body 是正确的首页，但 404 会让浏览器控制台、监控告警、
+/// `curl -f` 脚本和部分 HTTP 客户端全部当成失败。SPA 回退的语义就是
+/// "这个路径由前端路由处理"，不是"资源不存在"。
+async fn serve_index(index: std::path::PathBuf) -> Response {
+    match tokio::fs::read(&index).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(path = %index.display(), error = %e, "failed to read index.html");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// 挂载前端静态资源（含 SPA 回退与缓存策略）。
 ///
 /// 这样 `hotpot-server` 一个进程就是完整交付物：API、日志流、界面同源，
 /// 既避免了跨源部署时 CORS 的麻烦，也省掉一层反向代理。
@@ -259,7 +280,44 @@ pub fn frontend_router(dir: &std::path::Path) -> Router {
         return Router::new();
     }
     tracing::info!(dir = %dir.display(), "serving frontend assets");
-    Router::new().fallback_service(ServeDir::new(dir).not_found_service(ServeFile::new(index)))
+
+    // 这里用 `fallback` 而不是 `not_found_service`，是一个有实质后果的选择：
+    // `not_found_service` 内部是 `SetStatus`，会把回退响应的状态码**强制改成
+    // 404**，哪怕回退服务返回的是 200。而 SPA 回退的语义是「这个路径交给前端
+    // 路由处理」，不是「资源不存在」——状态码必须是 200，否则浏览器控制台、
+    // `curl -f` 脚本、监控探针全部把它记成失败，而 body 却是正确的首页。
+    // `fallback` 则保留回退服务自己的状态码。
+    //
+    // 另外只有「确实没有这个文件」才回首页：ServeDir 自身对真实 I/O 错误
+    // 已经返回 500，这类错误被伪装成正常首页会把磁盘故障藏起来。
+    let fallback_index = index.clone();
+    Router::new()
+        .fallback_service(
+            ServeDir::new(dir)
+                .append_index_html_on_directories(true)
+                .fallback(tower::service_fn(move |_req: Request| {
+                    let index = fallback_index.clone();
+                    async move { Ok::<_, std::convert::Infallible>(serve_index(index).await) }
+                })),
+        )
+        .layer(axum::middleware::from_fn(
+            |req: Request, next: Next| async move {
+                // 先取出判定缓存策略所需的路径：`req` 随后会被 move 进 next.run()。
+                // Vite 产物 `/assets/*` 的文件名带内容哈希，可以永久缓存；
+                // index.html 引用了那些哈希名，被缓存住就会一直指向已删除的旧资源
+                // （表现为「部署后白屏」），因此必须每次回源校验。
+                let cache_policy = if req.uri().path().starts_with("/assets/") {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "no-cache"
+                };
+                let mut res = next.run(req).await;
+                if let Ok(value) = HeaderValue::from_str(cache_policy) {
+                    res.headers_mut().insert(header::CACHE_CONTROL, value);
+                }
+                res
+            },
+        ))
 }
 
 #[cfg(test)]
@@ -306,5 +364,168 @@ mod tests {
     fn load_shedder_never_zero() {
         // 配成 0 时不能变成"拒绝一切"或 panic。
         assert_eq!(LoadShedder::new(0).limit(), 1);
+    }
+
+    /// 端到端钉死最关键的不变量：**SSE 豁免超时与限流，普通请求不豁免**。
+    ///
+    /// 这条如果哪天被"统一加中间件"顺手打破，后果是每次查看日志都会在
+    /// 超时点被服务端掐断，而且只在长构建上复现——很容易漏过。
+    mod behaviour {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use axum::routing::get;
+        use std::time::Duration as StdDuration;
+        use tower::ServiceExt as _;
+
+        /// 一个"慢端点"：睡指定时长再返回。
+        async fn slow(delay: StdDuration) -> Response {
+            tokio::time::sleep(delay).await;
+            (StatusCode::OK, "done").into_response()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn non_sse_request_is_timed_out() {
+            let app = timeout_middleware(
+                Router::new().route("/slow", get(|| slow(StdDuration::from_secs(3600)))),
+                StdDuration::from_secs(5),
+            );
+
+            let response = app
+                .oneshot(HttpRequest::get("/slow").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "慢请求必须被超时层切成 503"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn fast_request_passes_through() {
+            let app = timeout_middleware(
+                Router::new().route("/fast", get(|| async { (StatusCode::OK, "ok") })),
+                StdDuration::from_secs(5),
+            );
+
+            let response = app
+                .oneshot(HttpRequest::get("/fast").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn sse_request_is_not_timed_out() {
+            // 超时只有 1s，但 SSE 端点"跑"了 1 小时：只有豁免生效才会返回 200。
+            let app = timeout_middleware(
+                Router::new().route(
+                    "/v1/builds/{id}/logs/stream",
+                    get(|| slow(StdDuration::from_secs(3600))),
+                ),
+                StdDuration::from_secs(1),
+            );
+
+            let response = app
+                .oneshot(
+                    HttpRequest::get("/v1/builds/abc/logs/stream")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "SSE 必须豁免请求超时，否则长构建的日志流会被定期掐断"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn sse_does_not_consume_concurrency_budget() {
+            // 并发上限 1：先占满唯一许可，再验证 SSE 仍能通过。
+            let shedder = LoadShedder::new(1);
+            let _held = shedder.permits.clone().try_acquire_owned().unwrap();
+
+            let app = load_shed_middleware(
+                Router::new()
+                    .route(
+                        "/v1/builds/{id}/logs/stream",
+                        get(|| slow(StdDuration::from_secs(3600))),
+                    )
+                    .route("/fast", get(|| async { (StatusCode::OK, "ok") })),
+                shedder,
+            );
+
+            let sse = app
+                .clone()
+                .oneshot(
+                    HttpRequest::get("/v1/builds/abc/logs/stream")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(sse.status(), StatusCode::OK, "SSE 不应被并发限流挡住");
+
+            let plain = app
+                .oneshot(HttpRequest::get("/fast").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                plain.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "配额已被普通请求占满，普通请求应快速失败"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn saturated_server_sheds_plain_requests() {
+            let shedder = LoadShedder::new(1);
+            let app = load_shed_middleware(
+                Router::new().route("/slow", get(|| slow(StdDuration::from_secs(3600)))),
+                shedder.clone(),
+            );
+            // 手动占满唯一许可，模拟饱和。
+            let _held = shedder.permits.clone().try_acquire_owned().unwrap();
+
+            let response = app
+                .oneshot(HttpRequest::get("/slow").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "饱和时必须快速失败（503）而不是无限排队"
+            );
+        }
+
+        /// 回显请求体长度，用来观察 body limit 是否生效。
+        async fn echo_len(body: String) -> String {
+            body.len().to_string()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn body_limit_rejects_oversized_upload() {
+            use axum::routing::post;
+            let app = Router::new()
+                .route("/v1/builds", post(echo_len))
+                .layer(body_limit_layer(32));
+
+            let oversized = Body::from(vec![b'x'; 1024]);
+            let response = app
+                .oneshot(HttpRequest::post("/v1/builds").body(oversized).unwrap())
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_client_error(),
+                "超大请求体应被拒绝，实际 {}",
+                response.status()
+            );
+        }
     }
 }
