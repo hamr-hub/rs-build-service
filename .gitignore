@@ -16,3 +16,8 @@ Cargo.lock.bak
 
 # Graphify analysis artifacts
 graphify-out/
+
+# Web console (web/) build artifacts
+node_modules/
+web/dist/
+web/.env.local

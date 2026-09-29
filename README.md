@@ -27,7 +27,9 @@ Rust 的编译等待是真实的生产力损耗。现有方案要么是纯本地
   容器镜像版本自动匹配，未安装的工具链**明确失败**而非静默回落；
 - 🔒 **缓存端点鉴权**：可选 Bearer token（`HOTPOT_CACHE_TOKEN`），
   关闭「任何人往缓存里写伪造产物」的供应链投毒面；
-- 📊 **可观测**：`/metrics` 暴露构建状态分布、队列深度、五段耗时与**缓存命中率**。
+- 📊 **可观测**：`/metrics` 暴露构建状态分布、队列深度、五段耗时与**缓存命中率**；
+- 🖥️ **Web 控制台**：Vue 3 + Vite + TypeScript 单页应用（`web/`）——
+  仪表盘、提交构建、**SSE 实时日志**、产物下载、工具链盘点、深/浅双主题。
 
 ## 快速开始
 
@@ -82,6 +84,36 @@ hotpot artifacts <build-id>                 # 列出产物
 hotpot download <build-id> -o ./dist        # 下载全部产物
 hotpot toolchains                           # 查看可用工具链与镜像
 ```
+
+## Web 控制台
+
+`web/` 下是一个独立的 Vue 3 + Vite + TypeScript 单页应用，直接对接上面的
+HTTP API，不需要额外的后端胶水层：
+
+- **总览** —— 构建总数、成功率、队列深度、缓存命中率、状态分布、运行时信息；
+- **构建** —— 状态筛选、分页、就地取消，有在途构建时自动轮询；
+- **提交构建** —— 源码路径与档位配置，工具链下拉来自 `/v1/toolchains`，
+  附请求体实时预览；
+- **构建详情** —— 五段耗时分解 + **SSE 实时日志**（断线按 `since` 续传）
+  + 产物下载；
+- **工具链** —— 宿主 rustup 与容器镜像的合并清单。
+
+```bash
+# 一个终端起服务
+cargo run -p hotpot-api --bin hotpot-server
+
+# 另一个终端起前端
+cd web && npm install && npm run dev     # http://localhost:5173
+```
+
+前端默认请求 `/api/*`，由 Vite 开发代理转发到 `http://127.0.0.1:7878`
+（上游没有 CORS 中间件，用同源代理绕开）。换服务端：
+
+```bash
+HOTPOT_SERVER=http://builds.internal:7878 npm run dev
+```
+
+详见 [`web/README.md`](web/README.md)。
 
 ## 本地热重载开发
 
@@ -139,7 +171,7 @@ hotpot-agent --data-dir /var/lib/hotpot-agent status
 ## 架构
 
 ```
-crates/
+crates/                # Rust 服务端与 CLI
 ├── hotpot-core        # 领域模型、摘要/ID、错误
 ├── hotpot-store       # 内容寻址存储（256 桶、zstd、LRU）
 ├── hotpot-scheduler   # 任务队列、租约、事件持久化（SQLite）
@@ -149,6 +181,8 @@ crates/
 ├── hotpot-cli         # 命令行客户端
 ├── hotpot-agent       # 生产零停机部署 supervisor
 └── hotpot-dev         # 本地热重载开发循环
+
+web/                    # Web 控制台（Vue 3 + Vite + TypeScript）
 ```
 
 深入阅读：
@@ -172,6 +206,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 # Docker 执行器实测（daemon 不可达时自动跳过；colima 需把临时目录放在挂载路径内）：
 HOTPOT_TEST_TMP=$HOME/.hotpot-tmp cargo test -p hotpot-worker --test docker_live
+```
+
+前端：
+
+```bash
+cd web && npm ci && npm run build     # vue-tsc 类型检查 + 生产构建
 ```
 
 工具链：见 `rust-toolchain.toml`；MSRV 1.85。

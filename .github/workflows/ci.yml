@@ -58,3 +58,26 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build hotpot-server image
         run: docker build -t hotpot-server:ci .
+
+  web:
+    name: web console (typecheck / build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm run build` 内含 `vue-tsc -b`，类型错误会让这一档失败。
+      - name: Typecheck & build
+        run: npm run build

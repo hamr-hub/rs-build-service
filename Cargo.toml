@@ -11,7 +11,7 @@ members = [
     "crates/hotpot-agent",
     "crates/hotpot-dev",
 ]
-exclude = ["examples/demo-webapp"]
+exclude = ["examples/demo-webapp", "web"]
 
 [workspace.package]
 version = "0.1.0"
