@@ -23,13 +23,20 @@ const OVERRIDE_KEY = 'hotpot.apiBase'
 function resolveBase(): string {
   const injected = import.meta.env.VITE_HOTPOT_API as string | undefined
   const stored = localStorage.getItem(OVERRIDE_KEY)
-  return (stored || injected || '/api').replace(/\/+$/, '')
+  // 生产构建默认同源（空基址 = 相对路径），开发默认走 Vite 代理。
+  const fallback = import.meta.env.DEV ? '/api' : ''
+  return (stored || injected || fallback).replace(/\/+$/, '')
 }
 
 let base = resolveBase()
 
 export function apiBase(): string {
   return base
+}
+
+/** 基址是否为空（同源部署）。UI 用它显示"同源"而不是一个空地址。 */
+export function isSameOriginBase(): boolean {
+  return base === ''
 }
 
 /** UI 顶栏的"服务地址"设置：留空即回到代理默认值。 */

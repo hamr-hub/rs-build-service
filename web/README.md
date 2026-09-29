@@ -34,15 +34,46 @@ HOTPOT_SERVER=http://builds.internal:7878 npm run dev
 
 复制 `.env.example` 为 `.env.local` 可以固化这些配置。
 
-### 为什么需要代理
+### 两种部署形态（基址自动区分）
 
-上游 `hotpot-server` **没有** CORS 中间件，浏览器直接跨源调用会被拦。
-用同源代理转发是这里的标准解法，也让前端代码不必到处判断
-"开发走代理、生产走直连"。
+| 形态 | 做法 | API 基址 |
+|------|------|----------|
+| **开发** | `npm run dev`（Vite） | `/api`，由开发代理转发到服务端 |
+| **单进程** | `npm run build` + `hotpot-server --web-dir web/dist` | 同源（空基址），直接打 `/v1/...` |
+| **分离部署** | 静态托管 `dist/` + 独立服务端 | 填 `VITE_HOTPOT_API`，或界面左下角改 |
 
-如果部署形态是前后端同源（由 Nginx 把 `/api` 转发到服务端），同样无需改动。
-若确实要让前端直连跨域地址，需要在服务端或反向代理上补 CORS 头，
-然后在界面左下角的服务地址里填入真实地址（存在 `localStorage`，覆盖默认值）。
+基址由 `import.meta.env.DEV` 区分默认值，**不要写死 `/api`**：
+同源部署下所有请求都会打到 `/api/v1/...` 而 404，开发模式一切正常、
+一部署就"服务离线"。
+
+### 单进程部署（推荐）
+
+`hotpot-server` 可以直接托管前端产物，一个进程就是完整交付物 ——
+API、日志流、界面同源，既免掉跨源配置，也省掉一层反向代理：
+
+```bash
+cd web && npm run build
+cargo build --release -p hotpot-api --bin hotpot-server
+
+./target/release/hotpot-server \
+  --web-dir web/dist \
+  --cors-origins 'https://console.internal' \
+  --max-concurrent-requests 256 \
+  --request-timeout-secs 30
+```
+
+前端路由（`/builds`、`/builds/:id` …）由 SPA 回退返回 `index.html`，
+且**状态码是 200**（`ServeDir` 的 `not_found_service` 会保留 404，
+这里自己接管了分支）。`/assets/*` 带内容哈希，用
+`Cache-Control: immutable` 永久缓存；`index.html` 则是 `no-cache`，
+否则部署后会被缓存住、一直指向已删除的旧资源，表现为白屏。
+
+### 为什么开发需要代理
+
+上游 `hotpot-server` 默认**没有** CORS 中间件，浏览器直接跨源调用会被拦。
+开发时用同源代理转发；真要跨源部署，给服务端加
+`--cors-origins https://your-console`（精确白名单）即可，
+不要图省事用 `*`——构建 API 本身没有鉴权。
 
 ## 命令
 
@@ -100,15 +131,19 @@ src/
 `resolve_rust_image` 的推导保持一致：按首个 `-` 切开，只有前半段能解析成
 工具链时才认；`rust:slim-bookworm` 这类浮动标签返回"等价 stable"而不产出 spec。
 
+**渲染错误兜底。** `ErrorBoundary` 捕获子树渲染异常并给出可操作的出路
+（重试渲染 / 回到总览 / 忽略并继续）。这不是装饰：具名路由一旦解析失败
+就会在渲染期抛错，没有边界就是整页白屏，用户既不知道发生了什么也没法继续。
+
 **日志行数上限。** 长构建的日志能到几万行，全量留在 DOM 里会让滚动卡死。
-`LogViewer` 只保留最近 4000 行；用户手动往上翻时自动暂停跟随，
+`LogViewer` 只保留最近 20 000 行；用户手动往上翻时自动暂停跟随，
 避免日志把滚动条"抢"走。
 
 ## 已接入的 API
 
 | 方法 | 路径 | 用途 |
 |------|------|------|
-| `GET` | `/healthz` | 顶栏在线状态（15s 心跳） |
+| `GET` | `/healthz` | 顶栏在线状态（6s 心跳；标签页不可见时停摆） |
 | `GET` | `/v1/builds` | 构建列表（一次拉全量，状态筛选在客户端做） |
 | `GET` | `/v1/builds/{id}` | 构建详情 + 耗时回填 |
 | `POST` | `/v1/builds` | 提交构建 |

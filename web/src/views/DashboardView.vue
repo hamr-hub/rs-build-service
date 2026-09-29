@@ -8,6 +8,7 @@ import StatCard from '../components/StatCard.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { useBuildsStore } from '../stores/builds'
 import { useServerStore } from '../stores/server'
+import { useBuilderStore } from '../stores/builder'
 import { useVisibilityPolling } from '../composables/useVisibilityPolling'
 import type { BuildStatus } from '../api/types'
 import {
@@ -22,6 +23,7 @@ import {
 
 const builds = useBuildsStore()
 const server = useServerStore()
+const builder = useBuilderStore()
 
 const metrics = computed(() => server.metrics)
 
@@ -180,10 +182,10 @@ function sourceLabel(path: string): string {
           title="还没有构建记录"
           description="服务端刚启动或队列是空的。提交一次构建，这里就会活起来。"
         >
-          <RouterLink class="btn btn--primary" :to="{ name: 'build-new' }">
+          <button class="btn btn--primary" type="button" @click="builder.openBuilder()">
             <AppIcon name="plus" />
             提交第一个构建
-          </RouterLink>
+          </button>
         </EmptyState>
       </div>
     </section>

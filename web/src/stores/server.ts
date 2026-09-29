@@ -2,7 +2,15 @@
 
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { apiBase, getMetrics, hasApiOverride, ping, setApiBase, type MetricsSnapshot } from '../api/client'
+import {
+  apiBase,
+  getMetrics,
+  hasApiOverride,
+  isSameOriginBase,
+  ping,
+  setApiBase,
+  type MetricsSnapshot,
+} from '../api/client'
 
 export type ServerState = 'unknown' | 'online' | 'offline'
 
@@ -14,6 +22,7 @@ export const useServerStore = defineStore('server', () => {
   const metrics = ref<MetricsSnapshot | null>(null)
   const metricsError = ref<string | null>(null)
   const base = ref(apiBase())
+  const sameOrigin = ref(isSameOriginBase())
   const overridden = ref(hasApiOverride())
   const theme = ref<'dark' | 'light'>(
     (localStorage.getItem(THEME_KEY) as 'dark' | 'light' | null) ?? 'dark',
@@ -35,6 +44,7 @@ export const useServerStore = defineStore('server', () => {
   function updateBase(next: string | null): void {
     setApiBase(next)
     base.value = apiBase()
+    sameOrigin.value = isSameOriginBase()
     overridden.value = hasApiOverride()
     state.value = 'unknown'
     void check()
@@ -68,6 +78,7 @@ export const useServerStore = defineStore('server', () => {
 
   return {
     state,
+    sameOrigin,
     lastCheckAt,
     metrics,
     metricsError,

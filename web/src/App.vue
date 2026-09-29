@@ -171,7 +171,7 @@ void drawerOpen
             class="dot"
             :class="server.state === 'online' ? 'is-online' : server.state === 'offline' ? 'is-offline' : 'is-unknown'"
           />
-          <span class="server-chip__url">{{ server.base }}</span>
+          <span class="server-chip__url">{{ server.base || '同源' }}</span>
           <AppIcon name="chevronDown" :size="13" />
         </button>
         <p class="sidebar__hint">
