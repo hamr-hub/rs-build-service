@@ -1,0 +1,16 @@
+[package]
+name = "hotpot-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hotpot-core = { path = "../hotpot-core" }
+zstd = { workspace = true }
+walkdir = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

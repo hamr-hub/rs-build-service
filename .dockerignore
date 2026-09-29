@@ -1,0 +1,7 @@
+target
+.git
+.github
+graphify-out
+hotpot-data
+**/*.log
+.DS_Store

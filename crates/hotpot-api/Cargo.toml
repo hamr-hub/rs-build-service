@@ -1,0 +1,27 @@
+[package]
+name = "hotpot-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hotpot-core = { path = "../hotpot-core" }
+hotpot-store = { path = "../hotpot-store" }
+hotpot-scheduler = { path = "../hotpot-scheduler" }
+hotpot-worker = { path = "../hotpot-worker" }
+hotpot-cacheproto = { path = "../hotpot-cacheproto" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+walkdir = { workspace = true }
+uuid = { workspace = true }
+async-stream = "0.3"
+tokio-stream = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

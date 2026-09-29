@@ -1,0 +1,21 @@
+[package]
+name = "hotpot-cacheproto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hotpot-core = { path = "../hotpot-core" }
+hotpot-store = { path = "../hotpot-store" }
+sqlx = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

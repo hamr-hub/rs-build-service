@@ -1,0 +1,39 @@
+# Hotpot 一键自托管：docker compose up -d
+#
+# 服务容器通过 daemon socket 以「兄弟容器」方式启动构建容器（不是
+# docker-in-docker）。因此所有要与构建容器共享的路径（项目源码、会话数据）
+# 都必须在 daemon 宿主上真实存在，并以【相同的绝对路径】挂载进服务容器；
+# 否则 daemon 会把 bind source 当成空目录新建，典型症状是构建容器内
+# 「could not find Cargo.toml」。
+
+services:
+  hotpot:
+    build: .
+    image: hotpot-server:latest
+    # 覆盖镜像默认的 --data-dir /data：必须使用与宿主一致的绝对路径，
+    # 构建容器写回 target 的产物才能被服务进程读到并收入 CAS。
+    command:
+      - --listen
+      - 0.0.0.0:7878
+      - --data-dir
+      - ${HOTPOT_DATA_DIR:-$PWD/hotpot-data}
+    ports:
+      - "7878:7878"
+    volumes:
+      # 构建执行后端：与 daemon 对话
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 会话/缓存数据：服务内路径与宿主路径完全一致
+      - ${HOTPOT_DATA_DIR:-$PWD/hotpot-data}:${HOTPOT_DATA_DIR:-$PWD/hotpot-data}
+      # 可构建的项目根（默认当前目录）。提交构建时使用宿主绝对路径：
+      #   hotpot --server http://127.0.0.1:7878 build -p "$PWD/your-project"
+      - ${HOTPOT_PROJECT_ROOT:-$PWD}:${HOTPOT_PROJECT_ROOT:-$PWD}
+    environment:
+      HOTPOT_EXECUTOR: docker
+      HOTPOT_DOCKER_IMAGE: ${HOTPOT_DOCKER_IMAGE:-rust:1.98-slim-bookworm}
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7878/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped

@@ -1,0 +1,106 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hotpot-core",
+    "crates/hotpot-store",
+    "crates/hotpot-worker",
+    "crates/hotpot-scheduler",
+    "crates/hotpot-cacheproto",
+    "crates/hotpot-api",
+    "crates/hotpot-cli",
+    "crates/hotpot-agent",
+    "crates/hotpot-dev",
+]
+exclude = ["examples/demo-webapp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hyx/rs-build-service"
+authors = ["Hotpot Contributors"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Web / RPC
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "auth", "limit", "set-header"] }
+hyper = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Storage
+redb = "2"
+
+# Hashing / digest
+sha2 = "0.10"
+hex = "0.4"
+blake3 = "1"
+
+# Utilities
+bytes = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3"
+walkdir = "2"
+zstd = "0.13"
+ignore = "0.4"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+
+# Database (embedded SQLite now, Postgres later)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chrono", "uuid"] }
+
+# Object storage abstraction (local/S3/GCS/Azure)
+object_store = { version = "0.11", features = ["aws", "http"] }
+
+# Docker for MVP execution backend
+bollard = "0.18"
+
+# File watching (dev mode)
+notify = "7"
+
+# TOML config
+toml = "0.8"
+
+# Tar archives
+tar = "0.4"
+flate2 = "1"
+
+# OpenTelemetry
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.27"
+tracing-opentelemetry = "0.28"
+
+# Hot reloading (dev only)
+hot-lib-reloader = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Faster iteration on hotpot itself: compile dependencies optimized,
+# but keep hotpot crates unoptimized for fast rebuilds.
+[profile.dev.package."*"]
+opt-level = 3

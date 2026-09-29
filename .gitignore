@@ -1,0 +1,18 @@
+/target
+**/target
+Cargo.lock.bak
+
+# Hotpot local state
+*.hotpot.db
+*.hotpot.db-wal
+*.hotpot.db-shm
+/hotpot-data/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Graphify analysis artifacts
+graphify-out/
