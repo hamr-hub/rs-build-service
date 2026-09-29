@@ -5,13 +5,14 @@
  * 端点是软失败设计：daemon 不可达、rustup 不存在只会体现在 `warnings`，
  * 不会让整个请求 500。所以这里把 warnings 显式展示出来，而不是当成正常。
  */
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { ApiError, getToolchains } from '../api/client'
 import type { ToolchainInventory } from '../api/types'
 import { formatBytes, formatExecutor, imageToolchainSpec } from '../utils/format'
 import { useServerStore } from '../stores/server'
+import { useVisibilityPolling } from '../composables/useVisibilityPolling'
 
 const server = useServerStore()
 
@@ -36,15 +37,11 @@ async function load(): Promise<void> {
 }
 
 onMounted(load)
-let poller: number | undefined
-onMounted(() => {
-  poller = window.setInterval(() => {
-    if (server.online) void load()
-  }, 20_000)
-})
-onUnmounted(() => {
-  if (poller) window.clearInterval(poller)
-})
+
+// 工具链装好镜像不会频繁变，20s 一次足够；不可见时停摆。
+useVisibilityPolling(() => {
+  if (server.online) void load()
+}, 20_000)
 
 /** 镜像对应的工具链 spec；浮动标签（如 `rust:slim-bookworm`）没有版本段。 */
 function imageSpec(image: string): string {

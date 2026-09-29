@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 总览：一眼看清"现在有多少构建在跑、缓存有没有在干活、磁盘占了多少"。 */
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted } from 'vue'
 import { RouterLink } from 'vue-router'
 import EmptyState from '../components/EmptyState.vue'
 import AppIcon from '../components/AppIcon.vue'
@@ -8,6 +8,7 @@ import StatCard from '../components/StatCard.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { useBuildsStore } from '../stores/builds'
 import { useServerStore } from '../stores/server'
+import { useVisibilityPolling } from '../composables/useVisibilityPolling'
 import type { BuildStatus } from '../api/types'
 import {
   formatBytes,
@@ -96,16 +97,12 @@ const cacheProtocols = computed(() => {
 
 const recent = computed(() => builds.filtered.slice(0, 7))
 
-let poller: number | undefined
-
 onMounted(() => {
   void server.refreshMetrics()
-  poller = window.setInterval(() => void server.refreshMetrics(), 10_000)
 })
 
-onUnmounted(() => {
-  if (poller) window.clearInterval(poller)
-})
+// 指标 10s 一次；页面不可见时自动停摆（见 composable 的说明）。
+useVisibilityPolling(() => server.refreshMetrics(), 10_000)
 
 function sourceLabel(path: string): string {
   return shortenPath(path)

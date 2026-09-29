@@ -30,6 +30,9 @@ const PATHS: Record<string, string> = {
   trend: 'M3 17l6-6 4 4 8-8M15 7h6v6',
   package: 'M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3zM8 7.8l4 2.2 4-2.2M12 10v11',
   server: 'M4 4h16v6H4zM4 14h16v6H4zM7.5 7h.01M7.5 17h.01',
+  close: 'M6 6l12 12M18 6L6 18',
+  command: 'M9 6a2 2 0 1 0-2 2h2zm6 0a2 2 0 1 1 2 2h-2zM9 18a2 2 0 1 1-2-2h2zm6 0a2 2 0 1 0 2-2h-2zM9 9h6v6H9z',
+  search2: 'M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16zM21 21l-4.3-4.3',
   external: 'M14 4h6v6M20 4l-8 8M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',
 }
 

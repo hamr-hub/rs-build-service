@@ -11,15 +11,19 @@ import { RouterLink } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
 import LogViewer from '../components/LogViewer.vue'
 import StatusBadge from '../components/StatusBadge.vue'
-import { ApiError, artifactUrl, cancelBuild, getBuild, listArtifacts, streamLogs, type LogStreamHandle } from '../api/client'
+import { ApiError, artifactUrl, getBuild, listArtifacts, streamLogs, type LogStreamHandle } from '../api/client'
 import type { ArtifactMeta, BuildEvent, BuildRecord } from '../api/types'
 import { isTerminal } from '../api/types'
 import { useBuildsStore } from '../stores/builds'
+import { useBuilderStore } from '../stores/builder'
+import { useToastStore } from '../stores/toast'
 import { formatBytes, formatDuration, formatTime, shortId } from '../utils/format'
 
 const props = defineProps<{ id: string }>()
 
 const builds = useBuildsStore()
+const builder = useBuilderStore()
+const toast = useToastStore()
 
 const record = ref<BuildRecord | null>(null)
 const events = ref<BuildEvent[]>([])
@@ -30,7 +34,6 @@ const error = ref<string | null>(null)
 const actionError = ref<string | null>(null)
 const connected = ref(false)
 const streamNotice = ref<string | null>(null)
-const cancelling = ref(false)
 
 let stream: LogStreamHandle | null = null
 let recordPoller: number | undefined
@@ -135,29 +138,40 @@ async function load(): Promise<void> {
   startStreaming(props.id)
   await loadArtifacts()
 
-  // 耗时字段由 worker 陆续写入，非终态期间定期回填。
+  // 耗时字段由 worker 陆续写入，非终态期间定期回填（仅在页面可见时）。
   if (record.value && !isTerminal(record.value.status)) {
-    recordPoller = window.setInterval(() => void refresh(), 2000)
+    recordPoller = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refresh()
+    }, 2000)
   }
 }
 
+/** 取消交给 store：乐观更新 + 失败回滚 + toast 反馈都在那里统一处理。 */
 async function onCancel(): Promise<void> {
-  if (cancelling.value) return
-  cancelling.value = true
   actionError.value = null
-  try {
-    const next = await cancelBuild(props.id)
-    record.value = next
-    builds.patch(next)
-  } catch (cause) {
-    actionError.value = cause instanceof Error ? cause.message : String(cause)
-  } finally {
-    cancelling.value = false
+  const ok = await builds.cancel(props.id)
+  if (ok) {
+    const next = await getBuild(props.id).catch(() => null)
+    if (next) record.value = next
+  } else {
+    // 回滚后本地记录是旧的，重新拉一次以保持一致。
+    const next = await getBuild(props.id).catch(() => null)
+    if (next) record.value = next
   }
+}
+
+function rebuild(): void {
+  if (!record.value) return
+  builder.openBuilder({
+    path: record.value.source.kind === 'local' ? record.value.source.path : '',
+    profile: record.value.profile,
+    label: record.value.id,
+  })
 }
 
 function copyId(): void {
   void navigator.clipboard?.writeText(props.id)
+  toast.success('已复制构建 ID', props.id)
 }
 
 // 在详情页之间跳转（同一组件复用）时，重置并重新加载。
@@ -195,14 +209,25 @@ function downloadAll(): void {
           <AppIcon name="copy" :size="14" />
           复制 ID
         </button>
+        <!-- 构建器与详情页的结合点：改一个参数再跑一次，是调试失败构建的标准动作 -->
+        <button
+          v-if="record"
+          class="btn btn--sm"
+          type="button"
+          title="用相同源码与档位再提交一次"
+          @click="rebuild"
+        >
+          <AppIcon name="refresh" :size="14" />
+          以此配置重建
+        </button>
         <button
           v-if="record && !terminal"
           class="btn btn--sm btn--danger"
           type="button"
-          :disabled="cancelling"
+          :disabled="builds.cancelling.has(record.id)"
           @click="onCancel"
         >
-          {{ cancelling ? '取消中…' : '取消构建' }}
+          {{ builds.cancelling.has(record.id) ? '取消中…' : '取消构建' }}
         </button>
       </div>
     </div>

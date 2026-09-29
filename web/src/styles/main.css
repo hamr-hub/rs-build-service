@@ -1022,13 +1022,20 @@ ol {
   line-height: 1.6;
 }
 
+/*
+ * 行高固定 + 单行不换行：这是 LogViewer 窗口化渲染的前提。
+ * 日志按终端语义渲染（横向滚动），一条编译警告就是一"行"，
+ * seq 与内容的一一对应才不会被折行打乱。
+ */
 .log-line {
   display: flex;
+  align-items: center;
   gap: var(--sp-3);
   padding: 0 var(--sp-4);
-  white-space: pre-wrap;
-  word-break: break-word;
+  height: 21px;
+  white-space: pre;
   border-left: 2px solid transparent;
+  contain: layout paint;
 }
 
 .log-line:hover {
@@ -1054,7 +1061,15 @@ ol {
 .log-line__text {
   flex: 1;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: #c8bdb5;
+}
+
+/* 横向滚动条：整块日志区共享一条，而不是每行一条 */
+.console__body {
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .log-line--stderr .log-line__text {
@@ -1336,3 +1351,137 @@ ol {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---------- 15. 生产级补充零件 ---------- */
+
+/* 键盘可达性：Tab 时才出现，鼠标用户不会看到焦点环污染视觉 */
+.skip-link {
+  position: absolute;
+  top: var(--sp-2);
+  left: var(--sp-2);
+  z-index: 300;
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  transform: translateY(-200%);
+  transition: transform var(--speed) var(--ease);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+/* 键位提示 */
+.kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.kbd--on-accent {
+  border-color: color-mix(in srgb, var(--on-accent) 30%, transparent);
+  background: color-mix(in srgb, var(--on-accent) 16%, transparent);
+  color: var(--on-accent);
+  opacity: 0.75;
+}
+
+.sidebar__hint {
+  padding: 0 var(--sp-2);
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 搜索框 */
+.search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 240px;
+}
+
+.search__icon {
+  position: absolute;
+  left: var(--sp-3);
+  color: var(--text-3);
+  pointer-events: none;
+}
+
+.search .input {
+  padding-left: calc(var(--sp-3) * 2 + 16px);
+  padding-right: var(--sp-6);
+}
+
+.search__clear {
+  position: absolute;
+  right: var(--sp-2);
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.search__clear:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+/* 行内操作按钮组 */
+.row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-1);
+  opacity: 0;
+  transition: opacity var(--speed) var(--ease);
+}
+
+tr:hover .row-actions,
+tr:focus-within .row-actions {
+  opacity: 1;
+}
+
+/* 触屏没有 hover，操作按钮必须常驻 */
+@media (hover: none) {
+  .row-actions { opacity: 1; }
+}
+
+/* 搜索命中高亮 */
+mark {
+  padding: 0 1px;
+  border-radius: 2px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* 骨架屏行 */
+.skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+}
+
+.skeleton-row > span { display: block; }

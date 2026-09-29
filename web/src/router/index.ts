@@ -14,16 +14,15 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '构建', subtitle: '提交、跟踪与回溯所有构建', icon: 'stack' },
   },
   {
+    // 构建器已改为全局抽屉；这个旧链接保留重定向，避免书签/历史失效。
     path: '/builds/new',
-    name: 'build-new',
-    component: () => import('../views/NewBuildView.vue'),
-    meta: { title: '提交构建', subtitle: '选择一个本地 Cargo 项目并配置档位', icon: 'plus' },
+    redirect: { name: 'builds', hash: '#new' },
   },
   {
     path: '/builds/:id',
     name: 'build-detail',
     component: () => import('../views/BuildDetailView.vue'),
-    meta: { title: '构建详情', icon: 'stack', hideInNav: true },
+    meta: { title: '构建详情', subtitle: '实时日志、耗时分解与产物', hideInNav: true },
     props: true,
   },
   {
